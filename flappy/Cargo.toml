@@ -1,0 +1,9 @@
+[package]
+name = "flappy"
+version = "0.1.0"
+edition = "2021"
+description = "A small Flappy Bird game built on mini_engine"
+
+[dependencies]
+mini_engine = { path = "../engine" }
+macroquad = "0.4"
