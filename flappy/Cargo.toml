@@ -7,3 +7,4 @@ description = "A small Flappy Bird game built on mini_engine"
 [dependencies]
 mini_engine = { path = "../engine" }
 macroquad = "0.4"
+netcorehost = "0.20.1"
