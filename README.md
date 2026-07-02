@@ -1,134 +1,124 @@
-# mini_engine + Flappy Bird (dual Rust / C#)
+# Scripting-Language-Tests
 
-A **super-mini object-oriented game engine** in Rust, with **two flavours of
-Flappy Bird** — a pure-Rust version and a C#-scripted version, all sharing the
-same engine core.
+A playground for experimenting with different approaches to game logic — from
+traditional compilation to scripting languages to live function-level patching.
+All built on [macroquad](https://macroquad.rs).
 
-The engine (window, game loop, rendering) is Rust on
-[`macroquad`](https://github.com/not-fl3/macroquad). Pick your poison:
+## What's in the box
 
-| `cargo run` | Pure Rust (`game_rs`) — zero dependencies beyond `cargo` |
-| `cargo run --features cs` | C# (`game_cs`) — .NET-hosted, drives the engine via FFI |
+Three independent scenarios. Each uses a different approach to game logic — and
+importantly, **scenarios 1 & 2 share one engine, scenario 3 has its own**.
 
-![Flappy Bird running](docs/screenshot.png)
+| #   | Scenario                      | Engine                  | How game logic runs                                             |
+| --- | ----------------------------- | ----------------------- | --------------------------------------------------------------- |
+| 1   | **Flappy Bird — pure Rust**   | `engine/` (mini_engine) | Compiled into the binary — `game_rs/` is a regular Rust library |
+| 2   | **Flappy Bird — C# scripted** | `engine/` (mini_engine) | C# code in `game_cs/`, hosted via .NET runtime FFI              |
+| 3   | **Live-patching prototype**   | `live_engine/`          | `game_hot/` compiled as a cdylib, hot-reloaded at runtime       |
 
-> **New to this?** For a from-scratch explanation of how C# code can run on a
-> Rust engine — what FFI is, how the .NET runtime is hosted, and how the two
-> sides call each other — read
-> [docs/how-csharp-scripting-works.md](docs/how-csharp-scripting-works.md).
+> **Why two engines?**
+> The live-patching prototype needed a much simpler engine — no `Scene` trait,
+> no `World`, no object hierarchy. Rather than complicate `mini_engine`, it
+> lives in its own crate (`live_engine/`) focused purely on the hot-reload
+> mechanism. All three run on the same rendering backend (macroquad).
 
-## How the pieces fit
+---
 
-```
-┌─────────────────────────────┐         ┌──────────────────────────────┐
-│  Rust host (flappy.exe)      │         │  game_rs (pure Rust)          │
-│                              │         │                               │
-│  mini_engine loop  ──────────┼── Update/Draw ──▶  FlappyScene          │
-│  (macroquad window)          │         │   Bird / Pipe                 │
-│                              │         │                               │
-│     OR  (--features cs)      │         │  game_cs (.NET hosted)        │
-│                              │         │                               │
-│  EngineApi (fn pointers) ◀───┼── DrawCircle / KeyPressed / … ──────────┤
-│  → macroquad draw/input      │         │   via the Engine facade       │
-└─────────────────────────────┘         └──────────────────────────────┘
+## Scenario 1 — Flappy Bird (pure Rust)
+
+No external dependencies beyond `cargo`.
+
+```bash
+cargo run
 ```
 
-- **Rust version** (`game_rs`): the game logic is compiled directly into the
-  binary. No runtime, no FFI, no external tooling. Just a direct
-  `mini_engine::Scene` implementation.
+**What to expect:** a 480×720 Flappy Bird window. Press **Space** or click to
+flap the bird through pipes. **Esc** quits.
 
-- **C# version** (`game_cs`, opt-in): the host loads `hostfxr.dll` from the
-  installed .NET SDK at runtime, initializes the .NET runtime, resolves three
-  `[UnmanagedCallersOnly]` entry points (`Init` / `Update` / `Draw`), and calls
-  `Update`/`Draw` every frame from a `mini_engine` `Scene`.
-- **C# → Rust:** at startup the host hands C# an `EngineApi` — a `#[repr(C)]`
-  table of function pointers wrapping macroquad (draw, input, time, rng). C#
-  game code calls them through a friendly `Engine` facade.
+The game logic lives in `game_rs/` and is compiled as a regular Rust library.
 
-## Workspace layout
+---
+
+## Scenario 2 — Flappy Bird (C# scripted)
+
+Requires **.NET SDK 8+** installed (`dotnet --list-sdks` to check).
+
+```bash
+cargo run --features cs
+```
+
+**What to expect:** the exact same Flappy Bird game, but the bird, pipes,
+scoring, and rendering are all written in C# (`game_cs/`). The Rust engine
+hosts the .NET runtime and calls into the C# code every frame.
+
+First run takes longer — the build script compiles the C# project automatically.
+If you don't have .NET SDK 8, install it or change the target framework in
+`game_cs/game_cs.csproj` to match what you have (e.g. `net9.0`).
+
+---
+
+## Scenario 3 — Live-patching prototype
+
+> Uses its own engine (`live_engine/`) — not the same `mini_engine` as scenarios 1 & 2.
+
+```bash
+cargo run -p orchestrator
+```
+
+**What to expect:** an 800×600 window with a yellow circle you can move with
+**arrow keys** and jump with **Space**. Below the circle you'll see
+"HOT-PATCHABLE GAME v1".
+
+**To test live-patching:** keep the game running. In a second terminal or
+editor, open `game_hot/src/lib.rs` and make a change — for example, change
+the circle color or gravity. Save the file.
+
+The terminal running the game will print:
 
 ```
-.
-├── engine/            # mini_engine — the reusable Rust engine core
-│   └── src/{object,world,scene,context,engine}.rs
-├── flappy/            # the native host (flappy.exe)
-│   ├── build.rs       #   auto-builds game_cs when `--features cs` is set
-│   └── src/
-│       ├── main.rs    #   dual-mode entry point (Rust vs. C# via cfg)
-│       ├── ffi.rs     #   EngineApi: the C ABI exposed to C#
-│       └── hostfxr.rs #   dynamic hostfxr loading (C# path only)
-├── game_rs/           # the game — 100% Rust (default)
-│   └── src/
-│       ├── primitives.rs   # Vec2 / Rect / Color
-│       ├── config.rs       # Gameplay constants
-│       ├── bird.rs         # Player bird
-│       ├── pipe.rs         # Scrolling pipe pairs
-│       ├── flappy_scene.rs # Ready → Playing → GameOver state machine
-│       └── lib.rs
-└── game_cs/           # the game — 100% C# (opt-in)
-    └── src/
-        ├── EngineApi.cs    # struct mirroring flappy/src/ffi.rs (the contract)
-        ├── Engine.cs       # Key/MouseButton + the Engine facade
-        ├── Primitives.cs   # Vec2 / Rect / Color
-        ├── GameObject.cs   # GameObject base class + Config constants
-        ├── Bird.cs         # Bird : GameObject
-        ├── Pipe.cs         # Pipe : GameObject
-        ├── FlappyScene.cs  # Ready → Playing → GameOver, scoring, collisions
-        └── Interop.cs      # [UnmanagedCallersOnly] Init/Update/Draw
+[orchestrator] Change detected — rebuilding game_hot...
+[orchestrator] PATCHED — hot table updated (v3)
+```
+
+Switch back to the game window — your change takes effect on the next frame.
+No restart, no flicker. You can do this repeatedly.
+
+Changes you can try:
+- Player color → find `rgba(255, 200, 50, ...)` in `game_render`
+- Gravity → change the `GRAVITY` constant in `game_update`
+- Jump strength → change `FLAP_VELOCITY`
+- Add entirely new mechanics → edit `game_update`
+
+---
+
+## Project layout
+
+```
+├── engine/            # mini_engine — the Rust engine for scenarios 1 & 2
+├── flappy/            # Flappy Bird binary (scenarios 1 & 2)
+├── game_rs/           # Flappy Bird game logic — pure Rust
+├── game_cs/           # Flappy Bird game logic — C#
+├── game_hot/          # Hot-patchable game functions (scenario 3)
+├── live_engine/       # Separate engine for scenario 3 (live-patching)
+├── orchestrator/      # Builds, watches, and hot-patches game code
+└── docs/              # Additional documentation
 ```
 
 ## Prerequisites
 
 - **Rust** (stable) — `cargo`
-- **.NET SDK 8+** — `dotnet` on `PATH` (only needed for the C# path)
+- **.NET SDK 8+** — only for scenario 2
 
-## Build & run
+## Controls (scenarios 1 & 2)
 
-### Rust version (default — no .NET needed)
+| Key                | Action |
+| ------------------ | ------ |
+| Space / Up / Click | Flap   |
+| Esc                | Quit   |
 
-```bash
-cd flappy
-cargo run
-```
+## Controls (scenario 3)
 
-### C# version (requires .NET SDK)
-
-```bash
-cd flappy
-cargo run --features cs
-```
-
-The `cs` feature activates `build.rs` which runs `dotnet build game_cs -c Release`
-before the host, so everything is a single command.
-
-Equivalent manual C# steps:
-
-```bash
-dotnet build game_cs -c Release
-cd flappy
-cargo run --features cs
-```
-
-The C# host looks for the assembly at `game_cs/bin/Release/net8.0/`.
-Override with the `FLAPPY_MANAGED_DIR` environment variable if you build
-elsewhere or target a different framework.
-
-### Controls
-
-- **Space / Up arrow / Left click** — flap
-- **Esc** — quit
-
-Fly through the gaps; each pipe passed scores a point. Hitting a pipe or the
-ground ends the run, and your best score persists across retries in a session.
-
-## Extending the bridge
-
-To expose a new engine capability to C#:
-
-1. Add an `extern "C"` function and a field to `EngineApi` in
-   [flappy/src/ffi.rs](flappy/src/ffi.rs).
-2. Add the matching `delegate* unmanaged[Cdecl]<…>` field **in the same position**
-   to `EngineApi` in [game_cs/src/EngineApi.cs](game_cs/src/EngineApi.cs).
-3. Surface it on the `Engine` facade in [game_cs/src/Engine.cs](game_cs/src/Engine.cs).
-
-The field order is the ABI contract — keep both `EngineApi` structs in lockstep.
+| Key        | Action |
+| ---------- | ------ |
+| Arrow keys | Move   |
+| Space      | Jump   |
+| Esc        | Quit   |

@@ -4,7 +4,8 @@
 **/*.rs.bk
 *.pdb
 
-/target/
+# ---- Hot-reload artifacts ----
+game_hot_v*.dll
 
 # ---- .NET / C# ----
 # Build output

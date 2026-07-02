@@ -1,5 +1,12 @@
 [workspace]
-members = ["engine", "flappy"]
+members = [
+    "engine",
+    "flappy",
+    "game_rs",
+    "game_hot",
+    "live_engine",
+    "orchestrator",
+]
 resolver = "2"
 
 [profile.release]
