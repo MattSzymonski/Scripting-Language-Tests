@@ -1,11 +1,16 @@
-//! Build the C# game (`game_cs`) before the host, so `cargo run -p flappy`
-//! is a single command. Best-effort: if `dotnet` is missing the host still
-//! builds and reports a friendly error at runtime.
+//! Pure-Rust build by default. When the `cs` feature is enabled
+//! (`cargo run --features cs`), `dotnet build game_cs` is invoked before
+//! the host so the C# assembly is ready at runtime.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Only build the C# project when the `cs` feature is active.
+    if std::env::var("CARGO_FEATURE_CS").is_err() {
+        return;
+    }
+
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project = manifest.join("..").join("game_cs");
 

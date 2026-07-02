@@ -1,104 +1,165 @@
-//! Flappy Bird host.
+//! Flappy Bird host — dual-mode: pure Rust (default) or C# scripting (opt-in).
 //!
-//! This binary is the *native shell*: it owns the macroquad window and the
-//! `mini_engine` game loop, hosts the .NET runtime, and bridges the two so the
-//! actual game (in C#) can drive the engine as a "script".
-//!
-//! - **Rust -> C#:** every frame the engine calls the managed `Update`/`Draw`
-//!   entry points (see [`ScriptedScene`]).
-//! - **C# -> Rust:** the C# code calls back through [`EngineApi`], a table of
-//!   function pointers wrapping macroquad's drawing/input/time functions.
+//! ```text
+//! cargo run                     # Rust version (game_rs)
+//! cargo run --features cs       # C#  version (game_cs, needs .NET SDK)
+//! ```
 
-mod ffi;
-
-use std::path::PathBuf;
-
-use mini_engine::{Engine, EngineContext, Scene};
 use macroquad::prelude::*;
+#[cfg(not(feature = "cs"))]
+use mini_engine::Engine;
 
-use netcorehost::{nethost, pdcstr};
-use netcorehost::pdcstring::PdCString;
+// ---------------------------------------------------------------------------
+// Pure-Rust path (default)
+// ---------------------------------------------------------------------------
 
-use ffi::EngineApi;
+#[cfg(not(feature = "cs"))]
+mod imp {
+    use super::*;
+    use game_rs::FlappyScene;
 
-/// Managed entry points resolved out of the C# assembly. Their addresses are
-/// JIT-compiled native thunks we can call like ordinary `extern` functions.
-type InitFn = extern "system" fn(*const EngineApi);
-type UpdateFn = extern "system" fn(f32);
-type DrawFn = extern "system" fn();
+    pub fn window_title() -> &'static str {
+        "Flappy Bird — Rust"
+    }
 
-/// A `mini_engine` scene whose behaviour is entirely delegated to C#.
-struct ScriptedScene {
-    update: UpdateFn,
-    draw: DrawFn,
+    pub async fn run() {
+        Engine::new()
+            .with_clear_color(BLACK)
+            .run(FlappyScene::new())
+            .await;
+    }
 }
 
-impl Scene for ScriptedScene {
-    fn update(&mut self, ctx: &mut EngineContext) {
-        (self.update)(ctx.dt);
-        // The C# side calls `quit()` through the API, which sets this flag.
-        if ffi::quit_requested() {
-            ctx.quit();
+// ---------------------------------------------------------------------------
+// C# scripting path (`--features cs`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cs")]
+mod imp {
+    use std::path::PathBuf;
+
+    use macroquad::prelude::*;
+    use mini_engine::{Engine, EngineContext, Scene};
+
+    use crate::ffi::EngineApi;
+    use crate::hostfxr::HostfxrContext;
+
+    type InitFn = extern "system" fn(*const EngineApi);
+    type UpdateFn = extern "system" fn(f32);
+    type DrawFn = extern "system" fn();
+
+    struct ScriptedScene {
+        update: UpdateFn,
+        draw: DrawFn,
+    }
+
+    impl Scene for ScriptedScene {
+        fn update(&mut self, ctx: &mut EngineContext) {
+            (self.update)(ctx.dt);
+            if crate::ffi::quit_requested() {
+                ctx.quit();
+            }
+        }
+
+        fn draw(&self, _ctx: &EngineContext) {
+            (self.draw)();
         }
     }
 
-    fn draw(&self, _ctx: &EngineContext) {
-        (self.draw)();
+    fn managed_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("FLAPPY_MANAGED_DIR") {
+            return PathBuf::from(dir);
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("game_cs")
+            .join("bin")
+            .join("Release")
+            .join("net8.0")
+    }
+
+    fn load_managed_game() -> Result<(InitFn, UpdateFn, DrawFn), Box<dyn std::error::Error>> {
+        let dir = managed_dir();
+        let assembly = dir.join("game_cs.dll");
+        let runtime_config = dir.join("game_cs.runtimeconfig.json");
+
+        if !assembly.exists() {
+            return Err(format!(
+                "C# assembly not found at {}.\n\
+                 \n\
+                 Make sure game_cs is targeting a .NET SDK you have installed.\n\
+                 Build it manually:  dotnet build game_cs -c Release",
+                assembly.display()
+            )
+            .into());
+        }
+
+        // Load hostfxr.dll directly — no static libnethost needed.
+        let hostfxr = HostfxrContext::new(&runtime_config)?;
+
+        let init = hostfxr.get_unmanaged_fn::<InitFn>(
+            &assembly,
+            "Flappy.Interop, game_cs",
+            "Init",
+        )?;
+        let update = hostfxr.get_unmanaged_fn::<UpdateFn>(
+            &assembly,
+            "Flappy.Interop, game_cs",
+            "Update",
+        )?;
+        let draw = hostfxr.get_unmanaged_fn::<DrawFn>(
+            &assembly,
+            "Flappy.Interop, game_cs",
+            "Draw",
+        )?;
+
+        Ok((init, update, draw))
+    }
+
+    pub fn window_title() -> &'static str {
+        "Flappy Bird — C# on mini_engine"
+    }
+
+    pub async fn run() {
+        let (init, update, draw) = match load_managed_game() {
+            Ok(fns) => fns,
+            Err(e) => {
+                eprintln!("failed to start C# game: {e}");
+                for _ in 0..600 {
+                    clear_background(BLACK);
+                    draw_text("Failed to load C# game:", 20.0, 40.0, 28.0, RED);
+                    for (i, line) in e.to_string().lines().enumerate() {
+                        draw_text(line, 20.0, 80.0 + i as f32 * 26.0, 22.0, WHITE);
+                    }
+                    next_frame().await;
+                }
+                return;
+            }
+        };
+
+        let api = EngineApi::new();
+        init(&api as *const EngineApi);
+
+        Engine::new()
+            .with_clear_color(BLACK)
+            .run(ScriptedScene { update, draw })
+            .await;
     }
 }
 
-/// Locate the built C# assembly directory. Honors `FLAPPY_MANAGED_DIR`, else
-/// falls back to the project's `dotnet build -c Release` output.
-fn managed_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("FLAPPY_MANAGED_DIR") {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("game_cs")
-        .join("bin")
-        .join("Release")
-        .join("net10.0")
-}
+// ---------------------------------------------------------------------------
+// Shared entry point
+// ---------------------------------------------------------------------------
 
-/// Boot the .NET runtime, load the C# game, and return its entry points plus
-/// the engine API table the game will call back into.
-fn load_managed_game() -> Result<(InitFn, UpdateFn, DrawFn), Box<dyn std::error::Error>> {
-    let dir = managed_dir();
-    let assembly = dir.join("game_cs.dll");
-    let runtime_config = dir.join("game_cs.runtimeconfig.json");
-
-    if !assembly.exists() {
-        return Err(format!(
-            "C# assembly not found at {}.\nBuild it first with:  dotnet build game_cs -c Release",
-            assembly.display()
-        )
-        .into());
-    }
-
-    let hostfxr = nethost::load_hostfxr()?;
-    let config_pd = PdCString::from_os_str(runtime_config.as_os_str())?;
-    let context = hostfxr.initialize_for_runtime_config(&config_pd)?;
-
-    let assembly_pd = PdCString::from_os_str(assembly.as_os_str())?;
-    let loader = context.get_delegate_loader_for_assembly(assembly_pd)?;
-
-    // Assembly-qualified type name: "<Namespace>.<Type>, <AssemblyName>".
-    let type_name = pdcstr!("Flappy.Interop, game_cs");
-
-    let init = *loader
-        .get_function_with_unmanaged_callers_only::<InitFn>(type_name, pdcstr!("Init"))?;
-    let update = *loader
-        .get_function_with_unmanaged_callers_only::<UpdateFn>(type_name, pdcstr!("Update"))?;
-    let draw = *loader
-        .get_function_with_unmanaged_callers_only::<DrawFn>(type_name, pdcstr!("Draw"))?;
-
-    Ok((init, update, draw))
-}
+/// Only needed for the C# path.
+#[cfg(feature = "cs")]
+mod ffi;
+#[cfg(feature = "cs")]
+mod hostfxr;
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Flappy Bird — C# on mini_engine".to_owned(),
+        window_title: imp::window_title().to_owned(),
         window_width: 480,
         window_height: 720,
         window_resizable: false,
@@ -108,30 +169,5 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let (init, update, draw) = match load_managed_game() {
-        Ok(fns) => fns,
-        Err(e) => {
-            // Show the error in-window for a few seconds so it isn't missed.
-            eprintln!("failed to start C# game: {e}");
-            for _ in 0..600 {
-                clear_background(BLACK);
-                draw_text("Failed to load C# game:", 20.0, 40.0, 28.0, RED);
-                for (i, line) in e.to_string().lines().enumerate() {
-                    draw_text(line, 20.0, 80.0 + i as f32 * 26.0, 22.0, WHITE);
-                }
-                next_frame().await;
-            }
-            return;
-        }
-    };
-
-    // Hand the engine API table to C# once, up front. `api` lives for the whole
-    // run; C# copies it into its own static on the managed side.
-    let api = EngineApi::new();
-    init(&api as *const EngineApi);
-
-    Engine::new()
-        .with_clear_color(BLACK)
-        .run(ScriptedScene { update, draw })
-        .await;
+    imp::run().await;
 }

@@ -4,6 +4,8 @@
 **/*.rs.bk
 *.pdb
 
+/target/
+
 # ---- .NET / C# ----
 # Build output
 [Bb]in/
