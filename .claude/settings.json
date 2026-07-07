@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:news.ycombinator.com)",
+      "Bash(sort -t: -k2 -V)",
+      "Bash(uniq -c -f1)"
+    ]
+  }
+}

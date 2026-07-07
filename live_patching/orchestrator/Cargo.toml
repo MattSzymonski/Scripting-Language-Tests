@@ -1,0 +1,13 @@
+[package]
+name = "orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "Builds, loads, watches, and live-patches game functions into the engine"
+
+[dependencies]
+live_engine = { path = "../live_engine" }
+libloading = "0.8"
+notify = { version = "6", default-features = false, features = [
+    "macos_kqueue",
+] }
+macroquad = "0.4"

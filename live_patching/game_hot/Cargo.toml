@@ -1,0 +1,10 @@
+[package]
+name = "game_hot"
+version = "0.1.0"
+edition = "2021"
+description = "Hot-patchable game functions — compiled as cdylib for live reloading"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

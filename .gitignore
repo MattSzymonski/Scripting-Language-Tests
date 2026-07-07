@@ -6,6 +6,7 @@
 
 # ---- Hot-reload artifacts ----
 game_hot_v*.dll
+game_rs_v*.dll
 
 # ---- .NET / C# ----
 # Build output

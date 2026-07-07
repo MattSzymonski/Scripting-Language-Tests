@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "live_engine",
+    "orchestrator",
+    "game_hot",
+]
+default-members = ["orchestrator"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
