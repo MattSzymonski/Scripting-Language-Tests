@@ -34,3 +34,20 @@ desktop.ini
 .idea/
 *.swp
 *~
+
+# ---- Graphify knowledge graph ----
+graphify-out/
+.github/copilot-instructions.md
+
+# ---- DLL stress test artifacts ----
+# Generated plugin crates (not hand-written)
+dll_stresstesting/plugins/plugin_*/
+dll_stresstesting/plugins/target/
+dll_stresstesting/plugins/Cargo.toml
+dll_stresstesting/plugins/Cargo.lock
+
+dll_stresstesting/plugins_heavy/plugin_*/
+dll_stresstesting/plugins_heavy/target/
+dll_stresstesting/plugins_heavy/Cargo.toml
+dll_stresstesting/plugins_heavy/Cargo.lock
+# heavy_common/ is hand-written — NOT gitignored

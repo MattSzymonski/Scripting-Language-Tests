@@ -1,0 +1,8 @@
+[workspace]
+members = ["engine", "flappy", "game_rs", "stress_test"]
+default-members = ["flappy"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
