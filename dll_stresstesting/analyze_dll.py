@@ -20,6 +20,22 @@ posture (no ASLR, no PDB, oversized import/export tables, packed sections).
 C++ name demangling uses DbgHelp's UnDecorateSymbolName via ctypes, so the
 per-owning-type export breakdown is Windows-only; elsewhere it falls back to
 grouping by the UHT Z_Construct_* naming convention only.
+
+Architecture of this file, top to bottom:
+  1. Flag/lookup tables translating raw PE integer constants into readable names.
+  2. Small standalone helpers (hex formatting, flag decoding, entropy, demangling).
+  3. One `get_*` extraction function per PE concept (headers, sections, imports,
+     exports, debug info, TLS, load config, signature, version info, Rich header).
+     Each one takes the `pefile.PE` object (and sometimes the raw file bytes) and
+     returns a plain dict/list — no printing, no side effects — so the exact same
+     data can drive both the text report and the Markdown report without duplicating
+     any parsing logic.
+  4. `build_report()` — calls every extraction function once and assembles the
+     final report dict, including the derived `heuristics` list.
+  5. Two independent renderers over that same report dict: `print_report()` (plain
+     text to stdout) and `build_markdown()` (a Markdown document, optionally written
+     to disk via `--md-out`).
+  6. `main()` — argument parsing and wiring it all together.
 """
 
 import argparse
@@ -43,7 +59,14 @@ except ImportError:
 
 
 # ── flag tables (from the PE/COFF spec) ─────────────────────────────────────
+# These mirror the IMAGE_FILE_*, IMAGE_DLLCHARACTERISTICS_*, and IMAGE_SCN_*
+# constants from <winnt.h>. pefile exposes the raw integer bitmasks
+# (FILE_HEADER.Characteristics, OPTIONAL_HEADER.DllCharacteristics, and each
+# section's .Characteristics) but doesn't decode them into names itself, so we
+# do that ourselves via decode_flags() below.
 
+# IMAGE_FILE_* — overall COFF file header characteristics (is this a DLL? a
+# system file? stripped of debug info? etc).
 FILE_HEADER_FLAGS = {
     0x0001: "RELOCS_STRIPPED", 0x0002: "EXECUTABLE_IMAGE", 0x0004: "LINE_NUMS_STRIPPED",
     0x0008: "LOCAL_SYMS_STRIPPED", 0x0010: "AGGRESSIVE_WS_TRIM", 0x0020: "LARGE_ADDRESS_AWARE",
@@ -52,41 +75,75 @@ FILE_HEADER_FLAGS = {
     0x2000: "DLL", 0x4000: "UP_SYSTEM_ONLY", 0x8000: "BYTES_REVERSED_HI",
 }
 
+# IMAGE_DLLCHARACTERISTICS_* — the security/loader-behavior flags in the optional
+# header. The ones that matter most for load-time/security posture: DYNAMIC_BASE
+# (ASLR), NX_COMPAT (DEP), and GUARD_CF (Control Flow Guard) — all three are
+# checked directly in build_heuristics() below.
 DLL_CHARACTERISTICS_FLAGS = {
     0x0020: "HIGH_ENTROPY_VA", 0x0040: "DYNAMIC_BASE", 0x0080: "FORCE_INTEGRITY",
     0x0100: "NX_COMPAT", 0x0200: "NO_ISOLATION", 0x0400: "NO_SEH", 0x0800: "NO_BIND",
     0x1000: "APPCONTAINER", 0x2000: "WDM_DRIVER", 0x4000: "GUARD_CF", 0x8000: "TERMINAL_SERVER_AWARE",
 }
 
+# IMAGE_SCN_* — per-section characteristics. We only decode a subset here (the
+# ones relevant to understanding what a section actually contains and whether
+# it's readable/writable/executable); the full spec has many more (alignment
+# hints, COMDAT flags, etc.) that aren't useful for this kind of report.
 SECTION_FLAGS = {
     0x00000020: "CNT_CODE", 0x00000040: "CNT_INITIALIZED_DATA", 0x00000080: "CNT_UNINITIALIZED_DATA",
     0x02000000: "MEM_DISCARDABLE", 0x04000000: "MEM_NOT_CACHED", 0x08000000: "MEM_NOT_PAGED",
     0x10000000: "MEM_SHARED", 0x20000000: "MEM_EXECUTE", 0x40000000: "MEM_READ", 0x80000000: "MEM_WRITE",
 }
 
+# IMAGE_FILE_MACHINE_* — only the ones likely to actually show up in practice.
 MACHINE_TYPES = {0x014c: "x86 (I386)", 0x8664: "x64 (AMD64)", 0x01c4: "ARM", 0xaa64: "ARM64", 0x0200: "IA64"}
+
+# IMAGE_SUBSYSTEM_* — what environment this binary expects to run in.
 SUBSYSTEMS = {1: "NATIVE", 2: "WINDOWS_GUI", 3: "WINDOWS_CUI", 7: "POSIX_CUI", 9: "WINDOWS_CE_GUI", 14: "EFI_APPLICATION"}
 
+# Heuristic prefix match for "this is Windows/CRT plumbing every native binary
+# needs, not a dependency this specific module chose to have." Used to split
+# the imports table into "system" vs "module" so the interesting (your own
+# code's) dependencies aren't buried in kernel32/vcruntime/api-ms-win-crt-*
+# noise that shows up basically everywhere.
 SYSTEM_DLL_RE = re.compile(
     r'^(api-ms-win|kernel32|user32|advapi32|ntdll|msvcrt|vcruntime|ucrtbase|ole32|oleaut32|'
     r'ws2_32|shell32|gdi32|comctl32|comdlg32|rpcrt4|sechost|bcrypt|crypt32|version|winmm|'
     r'd3d|dxgi|dbghelp)', re.IGNORECASE)
 
+# Used by classify_export() to group a demangled C++ export by its owning
+# class/struct — e.g. "public: __cdecl SomeClass::SomeMethod(...)" -> "SomeClass".
+# This turns "here are 400 raw export names" into "here are the ~15 types that
+# actually generated those 400 names," which is almost always the more useful
+# way to look at a large export table.
 OWNER_RE = re.compile(r'\b([A-Za-z_]\w*)::')
+
+# Fallback grouping for one specific naming convention: Unreal Engine's header
+# tool (UHT) generates free functions named "Z_Construct_UClass_<TypeName>" (and
+# similarly for UPackage/UEnum/UScriptStruct) for reflection registration. Those
+# don't have a "::" in them (they're plain functions, not methods), so OWNER_RE
+# won't catch them — this pulls the actual type name back out of that specific
+# naming pattern instead. Harmless no-op on non-Unreal binaries (just won't match).
 ZCONSTRUCT_RE = re.compile(r'Z_Construct_U(?:Class|Package|Enum|ScriptStruct)_(?:[A-Za-z0-9_]+?_)??([A-Za-z0-9_]+)$')
 
 
 # ── small helpers ────────────────────────────────────────────────────────
 
 def sh(n):
+    """Format an integer as an uppercase, zero-padded 8-hex-digit string (e.g. addresses/RVAs)."""
     return f"0x{n:08X}"
 
 
 def decode_flags(value, table):
+    """Return the list of human-readable names whose bit is set in `value`, per `table`."""
     return [name for bit, name in table.items() if value & bit]
 
 
 def shannon_entropy(data):
+    """Shannon entropy of a byte string, in bits (0.0 = all one byte value, 8.0 = perfectly
+    uniform random bytes). Used both on the whole file and per-section: compressed, encrypted,
+    or packed data tends to sit close to 8.0, while normal code/data sections are lower (code
+    especially, since instruction encodings are far from uniformly distributed)."""
     if not data:
         return 0.0
     counts = Counter(data)
@@ -95,7 +152,12 @@ def shannon_entropy(data):
 
 
 def demangle_all(names):
-    """C++ demangle via DbgHelp. Windows-only; returns names unchanged elsewhere."""
+    """C++ demangle a batch of raw (decorated) export names via DbgHelp's
+    UnDecorateSymbolName, loaded through ctypes so this script has no compiled
+    dependency. Windows-only: on other platforms (or if dbghelp.dll can't be
+    loaded for some reason) this just returns each name mapped to itself, and
+    callers degrade gracefully (classify_export() falls back to the
+    Z_Construct_* heuristic, which doesn't need demangled text)."""
     if platform.system() != "Windows":
         return {n: n for n in names}
     try:
@@ -103,11 +165,14 @@ def demangle_all(names):
     except OSError:
         return {n: n for n in names}
 
-    UNDNAME_COMPLETE = 0x0000
-    buf = ctypes.create_string_buffer(2048)
+    UNDNAME_COMPLETE = 0x0000  # fully undecorate: return type, calling convention, everything
+    buf = ctypes.create_string_buffer(2048)  # reused across calls; UnDecorateSymbolName just overwrites it
     result = {}
     for n in names:
         try:
+            # UnDecorateSymbolName takes a plain (non-wide) C string in and writes the
+            # undecorated form into `buf`, returning the written length (0 on failure —
+            # e.g. for a name that was never C++-mangled in the first place).
             length = dbghelp.UnDecorateSymbolName(n.encode("mbcs", errors="replace"), buf, len(buf), UNDNAME_COMPLETE)
             result[n] = buf.value.decode("utf-8", errors="replace") if length > 0 else n
         except Exception:
@@ -116,7 +181,12 @@ def demangle_all(names):
 
 
 def classify_export(raw_name, demangled_name):
-    """Heuristic grouping of an export by its owning C++ type / UHT-generated symbol."""
+    """Heuristic grouping of a single export by its owning C++ type / UHT-generated symbol
+    family. Tries the demangled "Class::Method" pattern first (works for any C++ codebase);
+    falls back to the Unreal-specific Z_Construct_* naming convention (works even without
+    demangling, since that substring survives intact inside the still-mangled raw name); and
+    finally gives up with a generic bucket. This is what turns a raw export list into the
+    "top contributors by owning type" table."""
     m = OWNER_RE.search(demangled_name or "")
     if m:
         return m.group(1)
@@ -127,8 +197,16 @@ def classify_export(raw_name, demangled_name):
 
 
 # ── section-by-section extraction ───────────────────────────────────────
+# Every function below takes the pefile.PE object (and, where the parsed
+# object model doesn't already expose what we need, the raw file bytes too)
+# and returns plain dicts/lists — never prints anything itself. That keeps
+# all PE-parsing knowledge in one place, shared identically by both the text
+# and Markdown renderers further down.
 
 def get_file_info(path, raw):
+    """Whole-file identity: path, size, cryptographic hashes (for looking the file up
+    elsewhere / diffing two builds), and whole-file Shannon entropy (a coarse "is this
+    binary unusually packed/compressed overall" signal, refined per-section in get_sections)."""
     return {
         "path": str(path.resolve()),
         "size_bytes": len(raw),
@@ -140,6 +218,9 @@ def get_file_info(path, raw):
 
 
 def get_file_header(pe):
+    """The COFF file header: target architecture, section count, build timestamp (0 means
+    either a reproducible/deterministic build or a deliberately stripped timestamp), and the
+    decoded characteristics flags (notably whether this is actually a DLL)."""
     fh = pe.FILE_HEADER
     return {
         "machine": MACHINE_TYPES.get(fh.Machine, sh(fh.Machine)),
@@ -147,11 +228,18 @@ def get_file_header(pe):
         "timestamp_utc": (datetime.fromtimestamp(fh.TimeDateStamp, tz=timezone.utc).isoformat()
                            if fh.TimeDateStamp else "0 (stripped / reproducible build)"),
         "characteristics_flags": decode_flags(fh.Characteristics, FILE_HEADER_FLAGS),
-        "is_dll": bool(fh.Characteristics & 0x2000),
+        "is_dll": bool(fh.Characteristics & 0x2000),  # IMAGE_FILE_DLL
     }
 
 
 def get_optional_header(pe):
+    """The (misleadingly named — it's mandatory for DLLs/EXEs) optional header: entry point,
+    preferred load address, linker/OS/subsystem versions, and the security-relevant
+    DllCharacteristics flags (ASLR/DEP/CFG — see build_heuristics). Also recomputes the PE
+    checksum from the file bytes and compares it against the value stored in the header;
+    mismatches are extremely common for locally-built dev binaries (the checksum is often
+    only enforced/updated for drivers and a few other special cases) so this is informational,
+    not necessarily a red flag."""
     oh = pe.OPTIONAL_HEADER
     try:
         computed_checksum = pe.generate_checksum()
@@ -176,6 +264,12 @@ def get_optional_header(pe):
 
 
 def get_sections(pe):
+    """One entry per PE section (.text, .rdata, .data, ...): name, address/size, a compact
+    RWX permission string decoded from the Characteristics bitmask, and per-section Shannon
+    entropy (pefile's SectionStructure.get_entropy() computes this straight from that
+    section's raw bytes) — the single most useful field here for spotting packed/obfuscated
+    content, since a normal .text/.rdata section has a fairly predictable entropy range and
+    an outlier (see build_heuristics' 7.5 threshold) is worth a closer look."""
     out = []
     for s in pe.sections:
         name = s.Name.rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -184,6 +278,10 @@ def get_sections(pe):
             "virtual_address": sh(s.VirtualAddress),
             "virtual_size": s.Misc_VirtualSize,
             "raw_size": s.SizeOfRawData,
+            # 0x40000000 = IMAGE_SCN_MEM_READ, 0x80000000 = IMAGE_SCN_MEM_WRITE,
+            # 0x20000000 = IMAGE_SCN_MEM_EXECUTE (also present in SECTION_FLAGS above,
+            # inlined here too since we want a fixed-width "RWX"/"R-X"/etc string rather
+            # than the free-form flag-name list decode_flags() would produce).
             "permissions": ("R" if s.Characteristics & 0x40000000 else "-")
                           + ("W" if s.Characteristics & 0x80000000 else "-")
                           + ("X" if s.Characteristics & 0x20000000 else "-"),
@@ -194,6 +292,10 @@ def get_sections(pe):
 
 
 def get_imports(pe):
+    """The import table: for each DLL this binary depends on, every function (or bare
+    ordinal, if imported by number instead of name) it pulls from it, plus a system-vs-module
+    tag from SYSTEM_DLL_RE so the "your code's actual dependencies" signal isn't drowned out
+    by kernel32/vcruntime/etc noise that's present in essentially every native DLL."""
     result = []
     for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
         dll_name = entry.dll.decode("utf-8", errors="replace")
@@ -209,6 +311,12 @@ def get_imports(pe):
 
 
 def get_delay_imports(pe):
+    """Delay-load imports: dependencies the binary declared but deferred resolving until
+    first actual use (a linker-level, opt-in optimization — see the "delay-loading" section of
+    the general DLL-loading write-up). Structurally similar to get_imports() but a separate,
+    smaller directory; wrapped per-entry in try/except since delay-import parsing in pefile is
+    a little less battle-tested than the regular import directory, and a malformed/unusual
+    entry here shouldn't take down the rest of the report."""
     result = []
     for entry in getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []):
         try:
@@ -222,6 +330,13 @@ def get_delay_imports(pe):
 
 
 def get_exports(pe, demangle, top):
+    """The export table: every symbol this binary makes available to others. Each symbol is
+    either a plain name, an ordinal-only entry (no name — see the ordinal-vs-name trade-off in
+    the general write-up), or a forwarder (points at another DLL's export instead of code in
+    this one). When demangling is enabled, also classifies every named export by owning
+    type/symbol-family (see classify_export) and returns the `top` biggest contributors —
+    this is what turns "here are 400 exports" into "here are the ~15 types responsible for
+    them," which is almost always the more actionable view of a large export table."""
     export_dir = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
     if export_dir is None:
         return {"count": 0, "symbols": [], "by_type_top": []}
@@ -236,6 +351,9 @@ def get_exports(pe, demangle, top):
         if name:
             raw_names.append(name)
 
+    # Demangle everything in one batch up front (rather than per-symbol inline) so it's
+    # obvious this is the one place the (comparatively expensive, ctypes-call-per-name)
+    # demangling happens, and so --no-demangle only needs to skip this one call.
     demangled_map = demangle_all(raw_names) if demangle and raw_names else {}
     by_type = Counter()
     for s in symbols:
@@ -249,18 +367,31 @@ def get_exports(pe, demangle, top):
 
 
 def get_pdb_info(pe, raw):
+    """Parses the debug directory, and specifically decodes CodeView (type 2) entries in the
+    common "RSDS"/PDB70 format: a 4-byte signature, a 16-byte GUID, a 4-byte "age" counter, and
+    a null-terminated path to the matching .pdb file — this GUID+age pair is exactly what a
+    debugger/crash-reporting tool uses to verify it has the *exact* matching PDB for this
+    *exact* build (not just a same-named one from a different build). pefile doesn't decode
+    this format itself, so we do it manually here from the raw file bytes (hence needing `raw`
+    passed in, rather than relying only on the parsed pefile object model) — the debug
+    directory just tells us where in the file to find this blob and how big it is
+    (PointerToRawData / SizeOfData); the GUID's on-disk byte order is the usual mixed-endian
+    Windows GUID layout (first three fields little-endian, last two big-endian/as-is)."""
     results = []
     for dbg in getattr(pe, "DIRECTORY_ENTRY_DEBUG", []):
         s = dbg.struct
         entry = {"type": s.Type, "size": s.SizeOfData, "timestamp": s.TimeDateStamp}
-        if s.Type == 2 and s.SizeOfData >= 24:  # IMAGE_DEBUG_TYPE_CODEVIEW
+        if s.Type == 2 and s.SizeOfData >= 24:  # IMAGE_DEBUG_TYPE_CODEVIEW, big enough for a PDB70 header
             try:
                 dbg_raw = raw[s.PointerToRawData: s.PointerToRawData + s.SizeOfData]
                 sig = dbg_raw[:4]
-                if sig == b"RSDS":  # PDB70
+                if sig == b"RSDS":  # PDB70 (modern format; "NB10"/PDB20 below is the legacy one)
                     guid_bytes = dbg_raw[4:20]
                     age = struct.unpack("<I", dbg_raw[20:24])[0]
                     path = dbg_raw[24:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                    # GUID layout: Data1 (uint32 LE), Data2 (uint16 LE), Data3 (uint16 LE),
+                    # then Data4 as 8 raw bytes printed as-is — this reassembles the standard
+                    # "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" textual GUID form.
                     d1, d2, d3 = struct.unpack("<IHH", guid_bytes[:8])
                     d4 = guid_bytes[8:]
                     guid_str = f"{d1:08X}-{d2:04X}-{d3:04X}-{d4[0]:02X}{d4[1]:02X}-" + "".join(f"{b:02X}" for b in d4[2:])
@@ -268,12 +399,24 @@ def get_pdb_info(pe, raw):
                 elif sig == b"NB10":
                     entry.update({"format": "PDB20/NB10"})
             except Exception:
+                # Debug-directory contents that don't match our assumptions shouldn't break
+                # the whole report — just report the raw type/size and move on.
                 pass
         results.append(entry)
     return results
 
 
 def get_tls_callbacks(pe):
+    """Counts Thread Local Storage callbacks — functions the loader runs *before* the entry
+    point (DllMain), which makes them an easy-to-forget source of load-time cost or subtle
+    ordering bugs (see the loader-lock discussion in the general write-up). The TLS directory
+    only gives us the *address* of a callback pointer array in memory (AddressOfCallBacks,
+    expressed as a virtual address, i.e. relative to wherever the image is loaded — not a
+    file offset), so we convert that to an RVA by subtracting ImageBase, then walk the
+    null-terminated array of pointers (4 bytes on x86, 8 on x64) via pe.get_data(), which
+    reads bytes by RVA out of the mapped sections regardless of which section actually holds
+    them. The 64-entry cap is just a sanity backstop against ever looping forever on a
+    corrupted/adversarial file."""
     tls = getattr(pe, "DIRECTORY_ENTRY_TLS", None)
     if tls is None or not tls.struct.AddressOfCallBacks:
         return []
@@ -284,7 +427,7 @@ def get_tls_callbacks(pe):
         while len(callbacks) < 64:
             data = pe.get_data(rva + offset, ptr_size)
             val = struct.unpack("<Q" if ptr_size == 8 else "<I", data)[0]
-            if val == 0:
+            if val == 0:  # the array is terminated by a null pointer
                 break
             callbacks.append(sh(val))
             offset += ptr_size
@@ -294,6 +437,14 @@ def get_tls_callbacks(pe):
 
 
 def get_load_config(pe):
+    """A handful of fields from the Load Config directory relevant to exploit-mitigation
+    posture: the stack security cookie address (used by /GS buffer-overflow protection),
+    SafeSEH's registered exception-handler count, and the Control Flow Guard flags. Note this
+    is a *different* CFG signal than DLL_CHARACTERISTICS_FLAGS' GUARD_CF bit checked elsewhere:
+    that optional-header bit means "the loader should enforce CFG for this module," while
+    GuardFlags' IMAGE_GUARD_CF_INSTRUMENTED bit (0x100) means "this module's own code actually
+    contains CFG check instructions" — a binary can, in principle, have one without the other,
+    so both are worth surfacing rather than assuming they always agree."""
     lc_dir = getattr(pe, "DIRECTORY_ENTRY_LOAD_CONFIG", None)
     if lc_dir is None:
         return None
@@ -308,6 +459,12 @@ def get_load_config(pe):
 
 
 def get_signature_info(pe):
+    """Whether an Authenticode digital signature is present, purely by checking whether the
+    IMAGE_DIRECTORY_ENTRY_SECURITY data directory is populated. Deliberately does *not*
+    attempt to cryptographically verify the signature (chain of trust, revocation, etc.) —
+    that's a much bigger job than this script is trying to do; this only answers "is there a
+    signature blob attached at all," which is still a useful signal (e.g. for guessing whether
+    antivirus/EDR products are likely to treat this binary as more or less trusted)."""
     try:
         for d in pe.OPTIONAL_HEADER.DATA_DIRECTORY:
             if d.name == "IMAGE_DIRECTORY_ENTRY_SECURITY":
@@ -318,6 +475,8 @@ def get_signature_info(pe):
 
 
 def is_dotnet(pe):
+    """True if this PE has a populated COM Descriptor ("CLR header") data directory, i.e. it's
+    a .NET assembly (or a mixed-mode native/.NET binary) rather than a pure native module."""
     try:
         for d in pe.OPTIONAL_HEADER.DATA_DIRECTORY:
             if d.name == "IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR":
@@ -328,6 +487,12 @@ def is_dotnet(pe):
 
 
 def get_version_info(pe):
+    """The VERSIONINFO resource, if present: both the free-form "StringFileInfo" key/value
+    pairs (CompanyName, FileDescription, FileVersion as text, etc. — whatever the linker/build
+    process chose to embed) and the fixed-format VS_FIXEDFILEINFO numeric version fields
+    (packed as two 16-bit halves per 32-bit field, hence the ">> 16" / "& 0xFFFF" unpacking
+    below). Both can be present, absent, or disagree with each other in practice (the string
+    table is free-form and sometimes goes stale), so both are surfaced rather than picking one."""
     strings = {}
     for file_info_list in getattr(pe, "FileInfo", []):
         for fi in file_info_list:
@@ -349,13 +514,38 @@ def get_version_info(pe):
 def get_rich_header(raw):
     """Decode the (undocumented but stable) MSVC linker 'Rich' header: a build
     fingerprint of every compiler/linker tool version and object-file count
-    that went into this binary. Returns None if absent (e.g. /Brepro builds)."""
+    that went into this binary. Returns None if absent (e.g. /Brepro builds).
+
+    Format (all of this is reverse-engineered/community knowledge, not officially
+    documented by Microsoft, but has been stable for a very long time):
+      - Somewhere in the DOS-stub region of the file sits a "Rich" ASCII marker,
+        immediately followed by a 4-byte XOR key.
+      - Earlier in that same region sits a "DanS" marker, XORed with that same key
+        (i.e. `some_dword ^ key == "DanS"` at the right offset) — this is the true
+        start of the structure; "Rich" is only the terminator/key-holder.
+      - Between "DanS" (plus 3 reserved zero dwords right after it) and "Rich",
+        the bytes are a flat array of (CompId, Count) dword pairs, each XORed with
+        the same key. CompId packs a tool/product identifier in its high 16 bits
+        and a build number in its low 16 bits; Count is how many times that exact
+        tool/version combination was used (e.g. how many object files it compiled).
+      This is genuinely useful as a build fingerprint: two binaries built by the
+      exact same toolchain/settings will tend to produce the same Rich header
+      entries, which is a quick way to notice "this one dependency was clearly
+      built differently from the rest" without access to build logs.
+    """
     rich_off = raw.find(b"Rich")
     if rich_off == -1:
         return None
     try:
+        # The 4 bytes immediately after the "Rich" marker are the XOR key used
+        # to obfuscate the whole structure (for no strong reason beyond history/convention).
         key = struct.unpack("<I", raw[rich_off + 4:rich_off + 8])[0]
         dans_target = int.from_bytes(b"DanS", "little")
+
+        # Scan backwards in 4-byte steps looking for the XORed "DanS" marker. Bounded to
+        # 0x200 bytes before "Rich" since the DOS stub region is small and fixed-ish in size;
+        # if we don't find it in that window, this file's Rich header (if any) doesn't match
+        # the expected layout and we bail out rather than guess.
         dans_off, pos, min_pos = None, rich_off - 4, max(0, rich_off - 0x200)
         while pos >= min_pos:
             if struct.unpack("<I", raw[pos:pos + 4])[0] ^ key == dans_target:
@@ -365,17 +555,29 @@ def get_rich_header(raw):
         if dans_off is None:
             return None
 
-        entries, pos = [], dans_off + 16  # skip DanS + 3 reserved zero dwords
+        # Skip "DanS" itself (4 bytes) plus 3 reserved dwords that are always zero before
+        # XORing (so they read back as exactly `key` after XOR) — the real entries start
+        # 16 bytes after dans_off.
+        entries, pos = [], dans_off + 16
         while pos + 8 <= rich_off:
             comp_id, count = (v ^ key for v in struct.unpack("<II", raw[pos:pos + 8]))
             entries.append({"prod_id": (comp_id >> 16) & 0xFFFF, "build_id": comp_id & 0xFFFF, "count": count})
             pos += 8
         return {"key": sh(key), "entries": entries}
     except Exception:
+        # Any structural surprise here means "not the layout we expected" — safer to report
+        # no Rich header than to guess and print garbage.
         return None
 
 
 def build_heuristics(report):
+    """Turns the already-collected report data into a short list of plain-English notes about
+    things relevant to load-time performance or security posture. Deliberately conservative:
+    every check here is a simple, explainable threshold (not a scoring system), so each note
+    can be read on its own without needing the rest of the report for context. Thresholds
+    (20 imported DLLs, 200 exports, 7.5 entropy) are rules of thumb from practical experience
+    triaging real binaries, not hard technical limits — they're meant to flag "worth a closer
+    look," not "definitely a problem."""
     notes = []
     dllchar = report["optional_header"]["dll_characteristics_flags"]
     if "DYNAMIC_BASE" not in dllchar:
@@ -407,7 +609,11 @@ def build_heuristics(report):
 
 
 def build_report(path, pe, raw, demangle, top):
-    tls_callbacks = get_tls_callbacks(pe)
+    """Runs every extraction function exactly once and assembles the full report dict. This
+    is the single source of truth both renderers (print_report / build_markdown) consume —
+    neither renderer re-parses the PE object or re-derives anything beyond simple formatting,
+    which keeps the text and Markdown outputs guaranteed to agree with each other."""
+    tls_callbacks = get_tls_callbacks(pe)  # computed once and reused (count + full list) rather than calling twice
     report = {
         "file": get_file_info(path, raw),
         "file_header": get_file_header(pe),
@@ -424,11 +630,15 @@ def build_report(path, pe, raw, demangle, top):
         "version_info": get_version_info(pe),
         "rich_header": get_rich_header(raw),
     }
+    # Heuristics are derived from the report itself (not from pe/raw directly), so this has
+    # to run last, after every other field above already exists.
     report["heuristics"] = build_heuristics(report)
     return report
 
 
 # ── text report printer ─────────────────────────────────────────────────
+# Plain stdout report. Mirrors build_markdown()'s section order/content below,
+# just formatted for a terminal instead of a Markdown file.
 
 def _header(title):
     print(f"\n=== {title} ===")
@@ -468,7 +678,7 @@ def print_report(report, full):
     for d in imports:
         tag = "system" if d["is_system"] else "module"
         print(f"  [{tag:<6}] {d['dll']:<40} {d['function_count']} functions")
-        if full:
+        if full:  # --full: also dump every individual imported function name, not just counts
             for fn in d["functions"]:
                 print(f"             {fn}")
 
@@ -483,7 +693,7 @@ def print_report(report, full):
         print("  Top contributors by owning type/symbol group:")
         for name, count in ex["by_type_top"]:
             print(f"    {count:>5}  {name}")
-    if full:
+    if full:  # --full: also dump every individual export (ordinal, RVA, demangled name/forwarder)
         print()
         for s in ex["symbols"]:
             label = s.get("demangled", s["name"]) or f"(ordinal {s['ordinal']} only)"
@@ -539,6 +749,9 @@ def print_report(report, full):
 
 
 # ── markdown report writer ───────────────────────────────────────────────
+# Same report dict, same section order as print_report() above, just emitted
+# as Markdown (tables + collapsible <details> blocks for the potentially very
+# long full import/export symbol dumps) instead of plain-text alignment.
 
 def _md_escape(value):
     # Table cells like "<other>"/"<ordinal-only>" would otherwise be parsed as literal
@@ -547,12 +760,18 @@ def _md_escape(value):
 
 
 def _md_table(headers, rows):
+    """Build a GitHub-flavored-Markdown pipe table from a header row and a list of row lists."""
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
     lines += ["| " + " | ".join(_md_escape(c) for c in row) + " |" for row in rows]
     return "\n".join(lines)
 
 
 def build_markdown(report, full):
+    """Renders the full report as a single Markdown document (returned as a string; main()
+    decides whether/where to write it to disk). `full` controls the same thing it does in
+    print_report(): whether every individual import/export symbol gets listed (inside
+    collapsible <details> blocks here, since a 400+ row table would otherwise dominate the
+    whole document) or just the summary counts/tables."""
     f = report["file"]
     fh, oh = report["file_header"], report["optional_header"]
     lines = [f"# DLL Analysis: {Path(f['path']).name}", ""]
@@ -589,6 +808,8 @@ def build_markdown(report, full):
                         [[d["dll"], "system" if d["is_system"] else "module", d["function_count"]]
                          for d in imports]), ""]
     if full:
+        # One collapsible block per imported DLL, so a module with hundreds of imported
+        # functions doesn't force-expand the whole document by default.
         for d in imports:
             lines += [f"<details><summary>{d['dll']} — {d['function_count']} functions</summary>", "",
                       "```", *d["functions"], "```", "", "</details>", ""]
@@ -604,6 +825,9 @@ def build_markdown(report, full):
         lines += ["### Top contributors by owning type/symbol group", "",
                   _md_table(["Count", "Type"], [[c, n] for n, c in ex["by_type_top"]]), ""]
     if full:
+        # The full per-symbol table can easily run into the hundreds of rows for a large
+        # module (see the 407-export example this script was originally built to inspect) —
+        # collapsed by default for the same reason as the per-DLL import blocks above.
         rows = []
         for s in ex["symbols"]:
             label = s.get("demangled", s["name"]) or f"(ordinal {s['ordinal']} only)"
@@ -663,6 +887,9 @@ def build_markdown(report, full):
 
 
 def write_markdown_report(report, out_dir, dll_path, full):
+    """Renders and writes the Markdown report to `out_dir/<dll_stem>_dll_analysis.md`,
+    creating the output directory (and any missing parents) if needed. Returns the path
+    written, so the caller can print a confirmation message."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{dll_path.stem}_dll_analysis.md"
@@ -697,7 +924,7 @@ def main():
         sys.exit(1)
 
     report = build_report(path, pe, raw, demangle=not args.no_demangle, top=args.top)
-    pe.close()
+    pe.close()  # release pefile's internal resources; we already have everything we need in `report`
 
     if args.json:
         print(json.dumps(report, indent=2))
