@@ -428,9 +428,7 @@ Where 6 of them are always OS related DLLs like:
 - api-ms-win-crt-math-l1-1-0.dll
 - api-ms-win-crt-runtime-l1-1-0.dll
 
-## A representative module: UnrealEditor-RedRoads.dll
-
-Full analysis: [UnrealEditor-RedRoads_dll_analysis.md](UnrealEditor-RedRoads_dll_analysis.md)
+## A representative module: UnrealEditor-X.dll
 
 - File size: 479,744 bytes (~0.46 MB) — about half the project's average of ~0.93 MB/DLL
 - 13 direct dependencies (7 real modules + 6 OS/CRT DLLs) — slightly below the project's 16-dependency average
@@ -462,7 +460,7 @@ Full analysis: [UnrealEditor-RedRoads_dll_analysis.md](UnrealEditor-RedRoads_dll
 ## Where the 36 seconds actually goes
 
 - A 19 ms *average* with a 36-second total strongly implies a long-tail distribution, not a
-  uniform one: most of the 1,929 modules (like `RedRoads` above) cost low single-digit
+  uniform one: most of the 1,929 modules (like `X` above) cost low single-digit
   milliseconds, while a much smaller number of outliers — whichever modules happen to be first in
   the boot sequence to touch a heavy, not-yet-loaded shared subsystem — account for a
   disproportionate share of the total. This isn't hypothetical for this project: two structurally
