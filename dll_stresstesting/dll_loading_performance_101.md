@@ -404,3 +404,79 @@ everything eagerly at load time.
 - **Entropy** (in this context) — a statistical measure (0-8 bits) of how "random-looking" a
   section's bytes are; unusually high entropy is a common signal of compressed, encrypted, or
   packed content.
+
+# Example AAA Unreal Engine game project breakdown
+
+## Raw numbers
+
+- Each module is a DLL
+- There are 1929 modules
+
+Total DLL loading time: 36000ms
+Average DLL loading time: 19ms
+
+Total DLL file size is 1800mb (almost 2gb)
+
+StartupModule is just a code function is each module that is getting called after loading (Unreal related)
+
+On average each DLL has dependency on 16 other DLLs.
+Where 6 of them are always OS related DLLs like:
+- KERNEL32.dll
+- VCRUNTIME140.dll
+- VCRUNTIME140_1.dll
+- api-ms-win-crt-string-l1-1-0.dll
+- api-ms-win-crt-math-l1-1-0.dll
+- api-ms-win-crt-runtime-l1-1-0.dll
+
+## A representative module: UnrealEditor-RedRoads.dll
+
+Full analysis: [UnrealEditor-RedRoads_dll_analysis.md](UnrealEditor-RedRoads_dll_analysis.md)
+
+- File size: 479,744 bytes (~0.46 MB) — about half the project's average of ~0.93 MB/DLL
+- 13 direct dependencies (7 real modules + 6 OS/CRT DLLs) — slightly below the project's 16-dependency average
+- 407 exports
+- Structurally unremarkable by every static metric — exactly the profile of the large majority
+  of modules in a project this size: small, few dependencies, loads in a few milliseconds, and
+  never shows up in a load-time profiling report. It's included here as a "typical" data point,
+  not because it's slow.
+
+## Derived numbers / sanity checks
+
+- **Average file size per DLL**: 1,800 MB / 1,929 ≈ **0.93 MB**.
+- **19 ms × 1,929 modules ≈ 36,651 ms** — matches the stated 36,000 ms total closely enough to
+  confirm these per-module times are effectively summed on a single critical path (sequential
+  module loading during boot), not overlapped/parallelized across modules.
+- At normal SSD/NVMe throughput, physically reading 1.8 GB off disk takes a small fraction of a
+  second. Spending 36 seconds to move that much data, spread across 1,929 files, means the
+  bottleneck is **not bytes read** — it's the *fixed per-DLL overhead* (locate the file, parse
+  PE headers, walk the import table, resolve every symbol, apply relocations, set page
+  permissions, run static initializers, possibly get intercepted by AV/EDR) paid up to 1,929
+  times, plus whatever a smaller number of genuinely expensive outliers cost.
+- **16 average dependencies × 1,929 modules ≈ 31,000 dependency edges** in this project's DLL
+  graph (before deduplication). A graph that large is exactly the regime where transitive,
+  recursive dependency loading — see the general
+  [DLL Loading Performance 101](dll_loading_performance_101.md) writeup, section 6 — has room to
+  compound: loading one module can silently trigger loading a chain of others that aren't
+  resident yet.
+
+## Where the 36 seconds actually goes
+
+- A 19 ms *average* with a 36-second total strongly implies a long-tail distribution, not a
+  uniform one: most of the 1,929 modules (like `RedRoads` above) cost low single-digit
+  milliseconds, while a much smaller number of outliers — whichever modules happen to be first in
+  the boot sequence to touch a heavy, not-yet-loaded shared subsystem — account for a
+  disproportionate share of the total. This isn't hypothetical for this project: two structurally
+  near-identical modules from the same plugin were directly observed differing by more than 3x in
+  load time, with a 560 MB vs. 0-byte difference in memory delta, purely because of which one
+  happened to touch a shared dependency first.
+- Consequence: optimizing "the average module" (shrinking every DLL a little, trimming every
+  export table a little) has low leverage here — file size and export/import *counts* don't
+  meaningfully predict load cost at this scale. Optimizing the handful of true outliers has
+  outsized leverage, because that's where the actual seconds live.
+- `StartupModule` cost (this project's own post-load init function per module) is a separate,
+  *additive* line item on top of the OS-loader cost described above. It's squarely each module
+  owner's responsibility to fix, unlike the OS-loader-side transitive-dependency cost, which is
+  more of an architecture/build-topology problem (how many DLLs exist, and what depends on what).
+- Practical next step: rank all 1,929 modules by total load time (which the profiler already
+  produces) and focus investigation on the top-N outliers only — the bulk of the 36 seconds is
+  almost certainly concentrated there, not spread evenly across the corpus.
