@@ -2,7 +2,7 @@
 name = "stress_test"
 version = "0.1.0"
 edition = "2021"
-description = "DLL stress test: load 300 bird plugins, measure linking speed"
+description = "DLL stress test: AAA-scenario module graph (core/subsystem/leaf tiers), measures real recursive DLL loading"
 
 [dependencies]
 mini_engine = { path = "../engine" }
@@ -10,3 +10,5 @@ macroquad = "0.4"
 libloading = "0.8"
 notify = "6"
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
