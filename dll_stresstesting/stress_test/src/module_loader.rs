@@ -197,9 +197,8 @@ impl PluginManager {
         let versioned = versioned_dll_path(&self.release_dir, name, new_version);
         std::fs::copy(&original, &versioned).map_err(|e| format!("copy failed: {}", e))?;
 
-        let library = unsafe {
-            libloading::Library::new(&versioned).map_err(|e| format!("libloading failed: {}", e))?
-        };
+        let library = load_library_altered_search_path(&versioned)
+            .map_err(|e| format!("libloading failed: {}", e))?;
         let library = Arc::new(library);
         let identity = unsafe {
             let sym: libloading::Symbol<CreateInstanceFn> = library
@@ -590,7 +589,7 @@ const LOAD_RETRY_ATTEMPTS: u32 = 8;
 fn load_library_with_retry(path: &Path) -> Result<libloading::Library, libloading::Error> {
     let mut last_err = None;
     for attempt in 0..LOAD_RETRY_ATTEMPTS {
-        match unsafe { libloading::Library::new(path) } {
+        match load_library_altered_search_path(path) {
             Ok(lib) => return Ok(lib),
             Err(e) => {
                 last_err = Some(e);
@@ -599,6 +598,29 @@ fn load_library_with_retry(path: &Path) -> Result<libloading::Library, libloadin
         }
     }
     Err(last_err.expect("loop runs at least once"))
+}
+
+/// `stress_test.exe` (dll_stresstesting/target/release/) and the generated
+/// module DLLs (aaa_scenario/target/release/) live in different directories.
+/// Windows' default LoadLibrary search order resolves a loaded module's own
+/// transitive imports relative to the *calling process's* exe directory, not
+/// the directory the module itself was loaded from -- so without this flag, a
+/// module only loads successfully if every one of its dependencies happened
+/// to already be resident from an earlier, unrelated boot-order position
+/// (verified: two modules whose dependencies both load fine standalone still
+/// fail with ERROR_MOD_NOT_FOUND/126 when loaded by full path from here).
+/// `LOAD_WITH_ALTERED_SEARCH_PATH` makes the loader use the loaded module's
+/// own directory instead, which is exactly the co-location this scenario's
+/// generator already relies on (see build_aaa_scenario.py).
+#[cfg(windows)]
+fn load_library_altered_search_path(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
+    unsafe { WinLibrary::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH).map(Into::into) }
+}
+
+#[cfg(not(windows))]
+fn load_library_altered_search_path(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    unsafe { libloading::Library::new(path) }
 }
 
 fn versioned_dll_path(release_dir: &Path, name: &str, version: usize) -> PathBuf {

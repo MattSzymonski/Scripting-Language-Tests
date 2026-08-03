@@ -20,8 +20,9 @@ exactly how to pick the work back up elsewhere.
 5. [How to run it](#5-how-to-run-it)
 6. [What to expect / how to read the output](#6-what-to-expect--how-to-read-the-output)
 7. [Known limitation: EDR/AV interference](#7-known-limitation-edrav-interference)
-8. [Resuming on another machine](#8-resuming-on-another-machine)
-9. [Tuning knobs](#9-tuning-knobs)
+8. [Postmortem: the mass load failures were a search-path bug, not EDR](#8-postmortem-the-mass-load-failures-were-a-search-path-bug-not-edr)
+9. [Resuming on another machine](#9-resuming-on-another-machine)
+10. [Tuning knobs](#10-tuning-knobs)
 
 ---
 
@@ -125,12 +126,19 @@ Cargo's own dependency graph has no idea about the link above (it's a raw
 linker arg, not a `[dependencies]` entry), so nothing else enforces build
 order. `build_aaa_scenario.py` builds **core → subsystem → leaf**, in that
 order, all sharing one `--target-dir` (`aaa_scenario/target/`) so every
-`.dll` and `.dll.lib` ends up in the same folder. That matters for a second
-reason: Windows' loader searches the directory of the module *currently being
-loaded* first when resolving that module's own dependencies (given a full,
-absolute path) — verified empirically — so co-locating every module's output
-is what makes the dependency chain resolve without any extra search-path
-configuration (no `SetDllDirectory` needed).
+`.dll` and `.dll.lib` ends up in the same folder.
+
+> **Correction (see [section 8](#8-postmortem-the-mass-load-failures-were-a-search-path-bug-not-edr)):**
+> this section originally claimed Windows' loader searches the directory of
+> the module *currently being loaded* first when resolving that module's own
+> dependencies, and that co-locating every module's output was therefore
+> sufficient on its own. That's wrong: by default, the loader resolves a
+> loaded module's transitive imports relative to the **calling process's own
+> executable directory**, not the directory of the module being loaded. Since
+> `stress_test.exe` and `aaa_scenario/target/release/` are different
+> directories, co-location alone did not make dependency resolution work —
+> `stress_test` explicitly opts into `LOAD_WITH_ALTERED_SEARCH_PATH` to get
+> the behavior this section originally (incorrectly) assumed was the default.
 
 ### 3.3 Independent size and cost distributions
 
@@ -229,6 +237,9 @@ dll_stresstesting/
 
   generate_aaa_modules.py          — generates the tiered module graph + manifest.json
   build_aaa_scenario.py            — builds core -> subsystem -> leaf in order
+  run_stress_test.py               — one-shot runner: (re)generate + build (optional,
+                                      asks first) -> run stress_test.exe -> time the
+                                      load -> close it -> print the result
 
   aaa_scenario/                    — ENTIRELY GENERATED, gitignored. Contains:
     manifest.json                  —   module graph: tier, deps, size/cost buckets, boot order
@@ -275,6 +286,16 @@ python build_aaa_scenario.py --tier leaf
 # 3. Run the stress test.
 cargo run -p stress_test --release                  # sequential (default)
 cargo run -p stress_test --release -- --parallel     # rayon parallel loading
+```
+
+Or, to do all of the above (optionally) and get a single measured wall-clock
+number for "process launch → modules loaded" printed at the end, use
+`run_stress_test.py` instead of driving the three steps by hand:
+
+```powershell
+python run_stress_test.py                # asks before regenerating/building
+python run_stress_test.py --yes          # skip regen+build, just run + time the existing build
+python run_stress_test.py --regen --scale medium --build --mode parallel
 ```
 
 Controls in the running window: `↑`/`↓` or `W`/`S` to scroll the module
@@ -350,7 +371,112 @@ If you see a high failure count when running this:
   `module_loader.rs`, or generating/building at a smaller `--scale` to reduce
   how many files get touched per run.
 
-## 8. Resuming on another machine
+## 8. Postmortem: the mass load failures were a search-path bug, not EDR
+
+After the harness had been sitting untouched for a while, resuming work at
+`--scale full` (1929 modules) reproduced the mass-`FAIL` symptom described in
+section 7 — but investigating it properly turned up a different, fully
+deterministic root cause, not EDR.
+
+**Symptom.** The same ~27-module subset (out of 51 at `--scale small`, and a
+proportionally similar subset at full scale) failed every single run with
+`libloading failed: LoadLibraryExW failed`, in the same order, **even
+immediately after a full `--clean` regenerate and rebuild** — not the
+"different count each run" pattern you'd expect from a genuinely transient
+antivirus scan lock.
+
+**Investigation.**
+1. Directly `LoadLibraryEx`'d a failing module's `.dll` outside the harness
+   (via a small PowerShell/.NET P/Invoke snippet) and captured the real
+   `GetLastError()`: **126, `ERROR_MOD_NOT_FOUND`** — consistently, not
+   intermittently.
+2. Checked every transitive dependency `.dll`/`.dll.lib` referenced by that
+   module actually existed on disk in `aaa_scenario/target/release/` —
+   they did.
+3. Inspected the failing module's PE import table with `analyze_dll.py`
+   (`pefile`) — it correctly listed its declared dependencies by bare name
+   (`aaa_core_04.dll`, `aaa_subsystem_073.dll`, plus the usual OS/CRT set).
+   Nothing wrong with the generated file itself.
+4. Loaded each of those two direct dependencies **standalone**, from the same
+   ad-hoc script — both succeeded. So every individual file was fine in
+   isolation; only loading the dependent *from the harness* failed.
+5. That combination — a module's declared dependencies load fine on their
+   own, but the module itself fails from the harness with 126 — is the
+   signature of a **DLL search-path problem**, not a missing or corrupt file:
+   `stress_test.exe` lives in `dll_stresstesting/target/release/`, while the
+   generated module DLLs live in the *different* directory
+   `aaa_scenario/target/release/`. Windows' default `LoadLibrary` search order
+   resolves a loaded module's own transitive imports relative to the
+   **calling process's executable directory**, not the directory the module
+   was itself loaded from (see the new section 11, item 12 of
+   [dll_loading_performance_101.md](dll_loading_performance_101.md)). Section
+   3.2's original assumption that "same-directory co-location" alone was
+   enough turned out to be wrong for exactly this reason.
+6. This also explains the *shape* of the original failures in a way pure EDR
+   scrutiny doesn't: `boot_order` is a random shuffle (section 3.4). A module
+   only succeeds if every one of its dependencies happened to *already* be
+   resident (loaded earlier as some other module's own direct `LoadLibrary`
+   target) by the time its turn came up — otherwise resolving its import from
+   scratch requires the file-system search that was never going to find
+   `aaa_scenario/target/release/` in the first place. That is a coin flip per
+   module dictated by shuffle order, not a probabilistic AV scan outcome —
+   consistent with the same ~50%-ish subset failing identically on repeat
+   runs against the same seed.
+
+**Fix.** `load_library_with_retry` (and the hot-reload path in
+`reload_module`) in `stress_test/src/module_loader.rs` now load every module
+with the `LOAD_WITH_ALTERED_SEARCH_PATH` flag, via
+`libloading::os::windows::Library::load_with_flags`, instead of plain
+`libloading::Library::new`. That flag makes the loader resolve a module's
+imports relative to *its own* directory rather than the process's, which is
+exactly the co-location behavior section 3.2 originally (incorrectly)
+assumed was the default.
+
+**Verification.** Full `--scale full` run (1929 modules) after the fix,
+via `run_stress_test.py --yes`:
+
+```
+PluginManager: loaded 1929/1929 modules in 22894.1 ms
+Results written to: .../aaa_scenario/last_run_results.csv
+```
+
+**1929/1929 loaded, zero failures** — versus mass failures before the fix on
+the identical generated scenario. 22.9s for 1929 modules is the same order of
+magnitude as the real Unreal reference (36s), which is itself a reasonable
+sanity check that the scenario is now measuring the phenomenon it was built
+to measure, rather than mostly measuring load failures.
+
+Breaking that 22.9s down by phase, from `last_run_results.csv`:
+
+| Phase | Total | Share |
+|---|---|---|
+| LoadLibrary | 8,684 ms | 99.7% |
+| GetSymbol | 5.2 ms | 0.1% |
+| CreateInstance | 0.0 ms | 0.0% |
+| StartupModule | 20.7 ms | 0.2% |
+| **Sum of phases** | **8,710 ms** | |
+
+Note the phase sum (8.7s) doesn't fully account for the reported total
+(22.9s, from Rust's own `start.elapsed()` around the whole loop) — the ~14s
+gap is bookkeeping that happens *outside* the four timed phases: the
+residency check (`GetModuleHandleW`) over each module's full transitive
+dependency closure before its load, and the two working-set memory samples
+(`K32GetProcessMemoryInfo`) around it. Neither is currently its own timed
+field in `ModuleMetrics`; a `bookkeeping_ms` column would close that gap if
+it turns out to matter for future analysis.
+
+**What this means for section 7.** EDR/AV interference is a real,
+independently-documented phenomenon (`ERROR_MOD_NOT_FOUND` can also occur from
+a genuine transient file lock during a real-time scan) and the bounded
+retry/backoff there is still worth keeping as a hardening measure — but it
+was **not** the explanation for the mass failures actually observed and
+root-caused in this session. If you see a *large, deterministically
+repeatable* subset of failures (same modules, same order, surviving a clean
+rebuild), suspect this search-path issue first — it's now fixed, so a stock
+checkout shouldn't hit it, but it's worth knowing if the symptom resurfaces
+after modifying how/where `stress_test.exe` or the generated DLLs get placed.
+
+## 9. Resuming on another machine
 
 Step by step, from a fresh clone/pull of this repo:
 
@@ -370,10 +496,14 @@ Step by step, from a fresh clone/pull of this repo:
    `--scale small` (~51 modules) first to confirm the toolchain/linking
    mechanism works end-to-end quickly, before committing to a `medium` or
    `full` run.
-5. **Run** `cargo run -p stress_test --release` and check the console: you
-   want `loaded == total` (or very close). If you see mass `FAIL`s, check
-   [section 7](#7-known-limitation-edrav-interference) for the EDR caveat —
-   on a machine without that interference this should just work.
+5. **Run** `cargo run -p stress_test --release` (or `python
+   run_stress_test.py --yes`) and check the console: you want `loaded ==
+   total` (or very close). A stock checkout already has the
+   `LOAD_WITH_ALTERED_SEARCH_PATH` fix from
+   [section 8](#8-postmortem-the-mass-load-failures-were-a-search-path-bug-not-edr),
+   so mass failures shouldn't recur; if they do anyway, check that section
+   first, then [section 7](#7-known-limitation-edrav-interference) for the
+   EDR caveat.
 6. **Compare** `aaa_scenario/last_run_results.csv` against
    `AAA-Scenario.csv` to see how this run's numbers stack up against the
    real Unreal reference data.
@@ -382,7 +512,7 @@ Step by step, from a fresh clone/pull of this repo:
    full --clean && python build_aaa_scenario.py`. Budget several minutes for
    the build, dominated by the leaf tier.
 
-## 9. Tuning knobs
+## 10. Tuning knobs
 
 All in `generate_aaa_modules.py` unless noted:
 

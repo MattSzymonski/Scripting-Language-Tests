@@ -17,8 +17,9 @@ any particular engine, framework, or codebase — it applies to any native DLL/E
 8. [Security features that add load-time cost](#8-security-features-that-add-load-time-cost)
 9. [Diagnosing load performance](#9-diagnosing-load-performance)
 10. [Mitigation strategies](#10-mitigation-strategies)
-11. [Other platforms](#11-other-platforms)
-12. [Glossary](#12-glossary)
+11. [Techniques to load DLLs faster, ranked mainstream to arcane](#11-techniques-to-load-dlls-faster-ranked-mainstream-to-arcane)
+12. [Other platforms](#12-other-platforms)
+13. [Glossary](#13-glossary)
 
 ---
 
@@ -298,7 +299,7 @@ In order of how much signal they give you relative to effort:
 2. **OS-level tracing** — this is the only way to see *inside* a single load call and get a
    breakdown of every nested library load, every scan, every page fault, with real timestamps.
    On Windows: Event Tracing for Windows (ETW), captured with Windows Performance Recorder and
-   viewed in Windows Performance Analyzer. Equivalents exist on other platforms (see section 11).
+   viewed in Windows Performance Analyzer. Equivalents exist on other platforms (see section 12).
 3. **Process/file activity monitoring** — general-purpose tools (e.g. Sysinternals Process
    Monitor on Windows, `strace`/`ltrace` on Linux) that show every file read, every module load,
    and — critically — let you spot an antivirus/EDR process's activity overlapping in time with
@@ -345,7 +346,88 @@ In order of how much signal they give you relative to effort:
 
 ---
 
-## 11. Other platforms
+## 11. Techniques to load DLLs faster, ranked mainstream to arcane
+
+Section 10 covers the general architectural mitigations (fewer/coarser DLLs, delay-loading,
+minimal static initializers, avoiding TLS callback work, fast/AV-excluded storage). This section
+goes further: concrete techniques, roughly ordered from "everyone should know this" to "genuinely
+obscure," including a couple of real gotchas encountered while building the AAA-scenario stress
+test in this repo.
+
+**Mainstream, highest leverage**
+
+1. **Consolidate fine-grained DLL splits.** The single biggest lever when the cost is dominated by
+   *fixed per-DLL overhead* rather than bytes (section 7, item 1 — this is exactly what the AAA
+   breakdown above found: ~19ms average regardless of size). Fewer, larger modules mean fewer
+   round trips through the entire load sequence. This is why engines that ship a modular editor
+   build typically switch to a monolithic build for shipping.
+2. **Delay-load rarely-used dependencies** (`/DELAYLOAD` on MSVC — see section 4). Spreads cost
+   across the session instead of paying all of it at boot, and dependencies that end up unused this
+   run cost nothing at all.
+3. **Move real work out of static initializers and TLS callbacks**, into an explicit function
+   called after the load sequence completes. This is usually the largest single line item once
+   transitive loading (section 6) is accounted for — in this repo's own harness, the `#[ctor]`
+   analog (`LoadLibrary_ms`) was consistently >99% of total measured load time per module.
+4. **Statically link the CRT** (`/MT` instead of `/MD`) to remove several of the always-present
+   OS/CRT imports every DLL otherwise carries (`VCRUNTIME140.dll`, the `api-ms-win-crt-*`
+   forwarders, etc.) — fewer imports to resolve per module, at the cost of a larger binary with its
+   own duplicated CRT state.
+5. **Warm the file-system cache** before a timed section by touching every DLL once — the classic
+   cold-vs-warm gap from section 7, item 2, made to work in your favor instead of confounding a
+   measurement.
+
+**More obscure**
+
+6. **Parallel `LoadLibrary` calls have a hard ceiling: the loader lock (section 6).** Relocation
+   fixup, TLS callbacks, and static-initializer execution all happen while the process-wide loader
+   lock is held, so only one thread can be doing *that part* at a time no matter how many threads
+   call `LoadLibrary` concurrently. Only the disk-I/O portion of a load (reading pages in) can
+   genuinely overlap across threads. Practical implication: loading DLLs from multiple threads is a
+   real but *bounded* win — don't expect anywhere near an N-times speedup from N threads.
+7. **Ordinal-based exports/imports** (see section 4) skip the export-name binary search on lookup.
+   Real but usually marginal — in this repo's own measurements, symbol lookup (`GetSymbol_ms`) was
+   about 0.1% of total load time, so this is the kind of optimization worth knowing about but rarely
+   worth reaching for first.
+8. **Preferred base address / rebasing** (`/BASE` per DLL, historically also done project-wide via
+   `rebase.exe`) avoids relocation fixups (section 3, step 3) if the image lands at its preferred
+   address. Mostly moot on modern Windows, since ASLR re-randomizes the base on every load anyway —
+   a much bigger deal in the pre-ASLR era than today.
+9. **`PrefetchVirtualMemory`** explicitly hints pages into memory ahead of the actual `LoadLibrary`
+   call, rather than relying on the OS's implicit prefetching (Superfetch/Prefetcher `.pf` files)
+   to have already done it from a previous run.
+
+**Arcane / gotchas worth knowing**
+
+10. **Code-signing + online revocation checks can silently stall a load on a network call.** If a
+    system enforces Authenticode verification with live CRL/OCSP checking (common under
+    WDAC/AppLocker policies in locked-down corporate environments), `LoadLibrary` can block on a
+    *network round trip* per signed DLL — a multi-second stall that looks nothing like a normal
+    load-time problem and won't show up in any static inspection of the file. Unsigned local dev
+    binaries skip this entirely, which is part of why they can paradoxically load faster than a
+    "properly" signed one on such a system.
+11. **`KnownDLLs`** (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs`) is the
+    registry-driven mechanism that lets core system DLLs (`kernel32.dll`, `ntdll.dll`, etc.) get
+    mapped once and shared/cached across every process on the machine, bypassing the normal
+    search-and-map sequence entirely. It's why those DLLs essentially never show up as the slow
+    part of any load — and it's not something user/plugin DLLs can opt into without administrative
+    registry changes, so it's more "good to know why the baseline is fast" than an actionable lever.
+12. **The loading process's own directory matters more than you'd expect — and can silently break
+    dependency resolution, not just slow it down.** Windows' default `LoadLibrary` search order
+    resolves a module's *own* transitive imports relative to the **calling process's executable
+    directory**, not the directory the module itself was loaded from. Concretely hit in this
+    repo: `stress_test.exe` (in `dll_stresstesting/target/release/`) was loading generated module
+    DLLs from a different directory (`aaa_scenario/target/release/`) — every module whose
+    dependencies hadn't *already* become resident from an earlier, unrelated position in the boot
+    order failed outright with `ERROR_MOD_NOT_FOUND` (126), rather than merely loading slowly. The
+    fix is `LOAD_WITH_ALTERED_SEARCH_PATH` (passed to `LoadLibraryEx`), which makes the loader
+    resolve that module's imports relative to *its own* directory instead of the process's. Worth
+    knowing even outside this specific bug, because the failure mode (intermittent-looking,
+    boot-order-dependent `LoadLibrary` failures) is easy to misdiagnose as antivirus/EDR
+    interference (section 7, item 3) when it's actually a search-path problem.
+
+---
+
+## 12. Other platforms
 
 The concepts above (symbols, exports/imports, lazy vs. eager resolution, static initializers,
 transitive loading) apply everywhere; only the container format and tooling names differ.
@@ -369,7 +451,7 @@ everything eagerly at load time.
 
 ---
 
-## 12. Glossary
+## 13. Glossary
 
 - **PE / COFF** — Portable Executable / Common Object File Format: the container format for
   Windows executables and DLLs.
