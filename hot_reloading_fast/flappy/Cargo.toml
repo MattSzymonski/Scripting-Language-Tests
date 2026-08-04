@@ -6,11 +6,12 @@ description = "A small Flappy Bird game built on mini_engine"
 
 [features]
 default = []
-cs = []
+cs = ["dep:libloading"]
 
 [dependencies]
 mini_engine = { path = "../engine" }
 macroquad = "0.4"
-libloading = "0.8"
-notify = "6"
-chrono = "0.4"
+game_rs = { path = "../game_rs" }
+subsecond = "0.7"
+dioxus-devtools = "0.7"
+libloading = { version = "0.8", optional = true }

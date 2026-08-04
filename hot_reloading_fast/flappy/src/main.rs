@@ -1,16 +1,23 @@
-//! Flappy Bird host — two modes: hot-reloaded Rust (default) or C# scripting
-//! (opt-in).
+//! Flappy Bird host — two modes: Rust hot-*patching* via subsecond (default),
+//! or C# scripting (opt-in).
 //!
 //! ```text
-//! cargo run                     # Rust version, hot-reloaded at runtime (game_rs)
-//! cargo run --features cs       # C#  version (game_cs, needs .NET SDK)
+//! dx serve --hot-patch -p flappy   # Rust version, function-level hot-patching (game_rs)
+//! cargo run --features cs          # C#  version (game_cs, needs .NET SDK)
 //! ```
 
 use macroquad::prelude::*;
 
 // ---------------------------------------------------------------------------
-// Hot-reloaded Rust path (default)
+// Subsecond hot-patching path (default, run via `dx serve --hot-patch`)
 // ---------------------------------------------------------------------------
+//
+// `game_rs` is statically linked in here as a normal dependency (not built
+// into a separate cdylib and loaded via `libloading`, the way an earlier
+// version of this project worked) — subsecond can only patch functions that
+// are part of the same build graph `dx` manages. Each call into game_rs is
+// wrapped in `subsecond::call` so ThinLink can redirect it to a freshly-
+// patched version without restarting the process.
 
 #[cfg(not(feature = "cs"))]
 mod imp {
@@ -19,53 +26,54 @@ mod imp {
     use macroquad::prelude::*;
     use mini_engine::{Engine, EngineContext, Scene};
 
-    use crate::ffi::{self, EngineApi};
-    use crate::hot_rs::{self, HotGame};
+    use crate::ffi::{self, engine_api_for_game_rs};
 
-    /// Forwards `Scene::update`/`draw` through the hot table — same shape as
-    /// `ScriptedScene` below for the C# path, just calling into a reloadable
-    /// cdylib instead of a hosted .NET assembly.
-    struct HotScene {
-        api: EngineApi,
-        /// The world buffer is allocated **once** and outlives every reload,
-        /// so gameplay state (bird position, pipes, score) survives a
-        /// hot-reload here — unlike the C# path, where each reload starts a
-        /// fresh managed heap.
+    struct SubsecondScene {
+        api: game_rs::api::EngineApi,
         world: Vec<u8>,
-        hot: HotGame,
     }
 
-    impl Scene for HotScene {
+    impl Scene for SubsecondScene {
         fn update(&mut self, ctx: &mut EngineContext) {
-            let update = self.hot.table.read_update();
-            update(&self.api, self.world.as_mut_ptr() as *mut c_void, ctx.dt);
+            let api = &self.api as *const game_rs::api::EngineApi;
+            let world = self.world.as_mut_ptr() as *mut c_void;
+            let dt = ctx.dt;
+            subsecond::call(|| {
+                game_rs::game_update(api, world, dt);
+            });
             if ffi::quit_requested() {
                 ctx.quit();
             }
         }
 
         fn draw(&self, _ctx: &EngineContext) {
-            let draw = self.hot.table.read_draw();
-            draw(&self.api, self.world.as_ptr() as *mut u8 as *mut c_void);
+            let api = &self.api as *const game_rs::api::EngineApi;
+            let world = self.world.as_ptr() as *mut u8 as *mut c_void;
+            subsecond::call(|| {
+                game_rs::game_draw(api, world);
+            });
         }
     }
 
     pub fn window_title() -> &'static str {
-        "Flappy Bird — Rust (hot-reload)"
+        "Flappy Bird — Rust (subsecond hot-patch)"
     }
 
     pub async fn run() {
-        let hot = hot_rs::start();
+        // Reports this process's ASLR base address to `dx serve` over a websocket
+        // so it knows where in memory to apply future patches — without this,
+        // dx logs "Ignoring hotpatch since there is no ASLR reference."
+        dioxus_devtools::connect_subsecond();
 
-        let world_size = (hot.table.read_world_size())();
+        let world_size = game_rs::game_world_size();
         let mut world: Vec<u8> = vec![0u8; world_size.max(1)];
-        let api = EngineApi::new();
+        let api = engine_api_for_game_rs();
 
-        (hot.table.read_init())(&api, world.as_mut_ptr() as *mut c_void);
+        game_rs::game_init(&api as *const game_rs::api::EngineApi, world.as_mut_ptr() as *mut c_void);
 
         Engine::new()
             .with_clear_color(BLACK)
-            .run(HotScene { api, world, hot })
+            .run(SubsecondScene { api, world })
             .await;
     }
 }
@@ -215,18 +223,12 @@ mod imp {
 // Shared entry point
 // ---------------------------------------------------------------------------
 
-/// Needed by both paths — both call back into the engine through the same
-/// `EngineApi` function table.
+/// Needed by both paths — each calls back into the engine through the same
+/// `EngineApi` function table shape.
 mod ffi;
 /// Only needed for the C# path.
 #[cfg(feature = "cs")]
 mod hostfxr;
-/// Only needed for the hot-reloaded-Rust path.
-#[cfg(not(feature = "cs"))]
-mod hot_rs;
-/// Only needed for the hot-reloaded-Rust path (watches `game_rs/src`).
-#[cfg(not(feature = "cs"))]
-mod watch;
 
 fn window_conf() -> Conf {
     Conf {

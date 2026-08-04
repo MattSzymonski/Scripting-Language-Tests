@@ -150,3 +150,28 @@ extern "C" fn ffi_rand_range(min: f32, max: f32) -> f32 {
 extern "C" fn ffi_quit() {
     QUIT.store(true, Ordering::Relaxed);
 }
+
+/// Builds a `game_rs::api::EngineApi` out of the same real macroquad-backed
+/// callbacks [`EngineApi::new`] builds its own (C#-path) `EngineApi` from —
+/// the two `EngineApi` structs are separate types with identical `#[repr(C)]`
+/// layouts by design (see `game_rs/src/api.rs`).
+pub fn engine_api_for_game_rs() -> game_rs::api::EngineApi {
+    game_rs::api::EngineApi {
+        screen_width: ffi_screen_width,
+        screen_height: ffi_screen_height,
+        get_time: ffi_get_time,
+        key_pressed: ffi_key_pressed,
+        mouse_left_pressed: ffi_mouse_left_pressed,
+        clear_background: ffi_clear_background,
+        draw_rectangle: ffi_draw_rectangle,
+        draw_rectangle_lines: ffi_draw_rectangle_lines,
+        draw_circle: ffi_draw_circle,
+        draw_circle_lines: ffi_draw_circle_lines,
+        draw_line: ffi_draw_line,
+        draw_triangle: ffi_draw_triangle,
+        draw_text: ffi_draw_text,
+        measure_text_width: ffi_measure_text_width,
+        rand_range: ffi_rand_range,
+        quit: ffi_quit,
+    }
+}

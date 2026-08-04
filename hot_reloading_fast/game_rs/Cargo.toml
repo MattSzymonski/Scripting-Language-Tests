@@ -2,9 +2,15 @@
 name = "game_rs"
 version = "0.1.0"
 edition = "2021"
-description = "Flappy Bird game logic, compiled as a cdylib for live reloading"
-
-[lib]
-crate-type = ["cdylib"]
+description = "Flappy Bird game logic, statically linked into flappy and hot-patched via subsecond"
 
 [dependencies]
+# Added purely for a hot-patch speed-at-scale experiment - not otherwise
+# needed by the game. See bulk_*.rs.
+rand = "0.8"
+sha2 = "0.10"
+noise = "0.9"
+regex = "1"
+itertools = "0.13"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"

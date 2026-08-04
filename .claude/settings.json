@@ -9,7 +9,35 @@
       "Bash(powershell -Command \"Get-Content 'z:\\\\OtherProjects\\\\Other\\\\Scripting-Language-Tests\\\\dll_stresstesting\\\\aaa_scenario\\\\manifest.json' | Select-String '\\\\\"total\\\\\"'\")",
       "Bash(python analyze_dll.py --help)",
       "Bash(cargo clean *)",
-      "Bash(taskkill //F //PID 37376)"
+      "Bash(taskkill //F //PID 37376)",
+      "Bash(mkdir -p \"z:/OtherProjects/Other/Scripting-Language-Tests/hot_reloading_fast/.cargo\")",
+      "Bash(tasklist //FI \"IMAGENAME eq flappy.exe\")",
+      "Bash(find \"/c/Users/mateusz.szymonski/.cargo/registry/src\" -maxdepth 1 -iname \"krates-*\" 2>/dev/null)",
+      "Read(//c/Users/mateusz.szymonski/.cargo/registry/src/**)",
+      "Bash(grep -A3 'name = \"krates\"' \"/c/Users/mateusz.szymonski/dev/dioxus/Cargo.lock\" | head -10)",
+      "Read(//c/Users/mateusz.szymonski/dev/dioxus/**)",
+      "Bash(grep -A3 'name = \"dioxus-devtools\"' \"/c/Users/mateusz.szymonski/dev/dioxus/Cargo.lock\" | head -6)",
+      "Bash(cd /c/Users/mateusz.szymonski/dev/dioxus/packages/cli/src/build && wc -l *.rs | sort -n | tail -20)",
+      "Read(//c/Users/mateusz.szymonski/dev/dioxus/packages/cli/src/build/**)",
+      "Bash(pdftotext webfetch-1785862551704-vbzwpq.pdf /c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/ksplice2.txt)",
+      "Bash(curl -sL \"https://blog.molecular-matters.com/sitemap.xml\")",
+      "Bash(grep -n \"run-pre matching\\\\|4.3 Solution\\\\|5. Implementation\\\\|stop machine\\\\|stop_machine\" /c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/ksplice2.txt | head -30)",
+      "Read(//c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/**)",
+      "Bash(sed -n '40,60p;63,76p;103,130p' /c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/ksplice2.txt)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/rust-lang/rust/master/compiler/rustc_codegen_llvm/src/attributes.rs\" -o /tmp/attrs.rs)",
+      "Read(//z/tmp/**)",
+      "Bash(curl -sL -A \"Mozilla/5.0\" -o jrebel.pdf \"https://www.sciencedirect.com/science/article/pii/S1571066111000429/pdf?md5=02d96feb523ee9bec8fe7bb05abf93ca&pid=1-s2.0-S1571066111000429-main.pdf\")",
+      "Bash(pdftotext -layout jrebel.pdf jrebel.txt)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/rust-lang/rust/master/compiler/rustc_session/src/options.rs\" -o /tmp/opts.rs)",
+      "Bash(grep -n \"jump instruction\\\\|trampoline\\\\|insert\" /c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/ksplice2.txt | head -20)",
+      "Bash(pdftotext webfetch-1785862899191-2tmz8r.pdf /c/Users/MATEUS~1.SZY/AppData/Local/Temp/claude/z--OtherProjects-Other-Scripting-Language-Tests/81563e47-6fae-4106-9898-253482a31854/scratchpad/kgraft.txt)",
+      "Bash(strings /tmp/mangle.o 2>/dev/null | grep -E \"^_ZN|^wrap|mangle\" | head -10)",
+      "Bash(curl -sL -o blink.cpp https://raw.githubusercontent.com/crosire/blink/main/source/blink.cpp)",
+      "Bash(curl -sL -o blink_readme.md https://raw.githubusercontent.com/crosire/blink/main/README.md)",
+      "Bash(curl -s https://raw.githubusercontent.com/rust-lang/rust/master/compiler/rustc_target/src/spec/base/windows_msvc.rs)"
+    ],
+    "additionalDirectories": [
+      "z:\\OtherProjects\\Other\\Scripting-Language-Tests\\hot_reloading_fast"
     ]
   }
 }
