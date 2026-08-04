@@ -75,6 +75,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dll_patch"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -260,6 +267,7 @@ dependencies = [
 name = "mini_engine"
 version = "0.1.0"
 dependencies = [
+ "dll_patch",
  "libloading",
  "macroquad",
 ]

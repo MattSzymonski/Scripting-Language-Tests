@@ -7,6 +7,9 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 
+[workspace.dependencies]
+dll_patch = { path = "../dll_live_patching/dll_patch" }
+
 [profile.dev]
 debug = true
 opt-level = 0

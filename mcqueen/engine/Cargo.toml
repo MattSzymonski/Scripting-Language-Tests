@@ -7,3 +7,4 @@ description = "A minimal game engine built on macroquad with DLL hot-reloading s
 [dependencies]
 macroquad = "0.4"
 libloading = "0.8"
+dll_patch = { workspace = true }

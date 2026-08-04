@@ -1,21 +1,9 @@
-// standalone/src/main.rs — Window, watcher, and hot-reload orchestrator
+// standalone/src/main.rs — Single game crate + dll_patch hot-reload
 //
-// REQUIREMENTS
-//   mini_engine (path = "../engine"), macroquad 0.4, notify 6
-//
-// DESCRIPTION
-//   Creates a macroquad window. Watches the game crate source directory
-//   for changes. When a .rs file is modified, runs `cargo build -p game`
-//   and reloads the resulting DLL into the engine — all without restarting
-//   the window. Press SPACE to launch/reset the bouncing ball.
-//
-// USAGE
-//   cargo run -p standalone
-//     Then edit game/src/lib.rs (e.g. change GRAVITY or BOUNCE_VELOCITY_Y).
-//     The watcher rebuilds and reloads automatically.
-//
-// EXAMPLE USAGE
-//   cargo run -p standalone
+// Watches game/src/ for .rs changes. On change: rebuilds game.dll,
+// copies to a versioned name, and tells the engine to apply the new
+// DLL as a dll_patch jump-table patch. The original game.dll stays
+// loaded; only the function pointers in the jump table change.
 //
 // --- SCRIPT ---
 
@@ -29,135 +17,101 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Basename of the game DLL that cargo produces.
-const GAME_DLL_NAME: &str = "game.dll";
-
-/// How long to wait after the last file-change event before triggering a
-/// rebuild (debounce — avoids rebuilding mid-edit).
-const DEBOUNCE_MS: u64 = 400;
-
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Wall-clock timestamp with millisecond precision (UTC).
 fn timestamp_now() -> String {
-    let duration = std::time::SystemTime::now()
+    let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let total_seconds = duration.as_secs();
-    let milliseconds = duration.subsec_millis();
-    let hours = (total_seconds / 3600) % 24;
-    let minutes = (total_seconds / 60) % 60;
-    let seconds = total_seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+    let s = d.as_secs();
+    let ms = d.subsec_millis();
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        (s / 3600) % 24,
+        (s / 60) % 60,
+        s % 60,
+        ms
+    )
 }
 
-/// Data passed from the watcher thread to the main thread when a new
-/// DLL is ready to be loaded.
-struct PendingReload {
+struct PendingPatch {
     path: PathBuf,
     started_at: Instant,
 }
 
-// ── File Watcher ──────────────────────────────────────────────────────────
+// ── Watcher ───────────────────────────────────────────────────────────────
 
-/// Spawn a background thread that watches `game/src/` for .rs changes,
-/// rebuilds via cargo, copies to a versioned name, and communicates the
-/// new DLL path back to the main thread via `pending_reload_path`.
 fn spawn_watcher(
     reload_flag: Arc<AtomicBool>,
-    pending_reload: Arc<Mutex<Option<PendingReload>>>,
+    pending: Arc<Mutex<Option<PendingPatch>>>,
     workspace_root: PathBuf,
 ) {
     std::thread::spawn(move || {
         let watch_dir = workspace_root.join("game").join("src");
         let build_dir = workspace_root.join("target").join("debug");
 
-        let (transmitter, receiver) = std::sync::mpsc::channel();
-
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = RecommendedWatcher::new(
-            move |result: Result<Event, notify::Error>| {
-                if let Ok(event) = result {
-                    // Only react to .rs file modifications (ignore temp files,
-                    // build artifacts, and directory metadata noise).
-                    let is_rust_source = event
+            move |res: Result<Event, notify::Error>| {
+                if let Ok(e) = res {
+                    let is_rs = e
                         .paths
                         .iter()
-                        .any(|path| path.extension().map(|ext| ext == "rs").unwrap_or(false));
-                    if is_rust_source && matches!(event.kind, EventKind::Modify(_)) {
-                        let _ = transmitter.send(());
+                        .any(|p| p.extension().map(|x| x == "rs").unwrap_or(false));
+                    if is_rs && matches!(e.kind, EventKind::Modify(_)) {
+                        let _ = tx.send(());
                     }
                 }
             },
             Config::default(),
         )
-        .expect("create file watcher");
+        .expect("watcher");
 
         watcher
             .watch(&watch_dir, RecursiveMode::Recursive)
-            .expect("watch game/src/ directory");
+            .expect("watch");
+        println!("[watcher] monitoring {}\n", watch_dir.display());
 
-        println!(
-            "[watcher] monitoring {} for changes...\n",
-            watch_dir.display()
-        );
+        let mut n: u32 = 0;
+        while let Ok(()) = rx.recv() {
+            std::thread::sleep(Duration::from_millis(400));
+            n += 1;
+            let started = Instant::now();
+            println!("[#{n}] {} | rebuild started", timestamp_now());
 
-        let mut reload_counter: u32 = 0;
-
-        while let Ok(()) = receiver.recv() {
-            // Debounce: wait for edits to settle
-            std::thread::sleep(Duration::from_millis(DEBOUNCE_MS));
-
-            reload_counter += 1;
-            let started_at = Instant::now();
-            println!(
-                "[watcher #{reload_counter}] {} | rebuild started",
-                timestamp_now()
-            );
-
-            // Recompile the game crate
-            let status = Command::new("cargo")
+            let ok = Command::new("cargo")
                 .args(["build", "-p", "game"])
                 .current_dir(&workspace_root)
                 .status()
-                .expect("spawn cargo build");
+                .map(|s| s.success())
+                .unwrap_or(false);
 
-            if !status.success() {
-                eprintln!(
-                    "[watcher #{reload_counter}] cargo build failed — check compiler errors above"
-                );
+            if !ok {
+                eprintln!("[#{n}] build failed");
                 continue;
             }
 
-            // Copy the fresh DLL to a versioned name to avoid Windows file-lock
-            // issues when the old one is still mapped.
-            let source_dll = build_dir.join(GAME_DLL_NAME);
-            let versioned_name = format!("game_v{reload_counter}.dll");
-            let destination_dll = build_dir.join(&versioned_name);
-            if let Err(error) = std::fs::copy(&source_dll, &destination_dll) {
-                eprintln!("[watcher #{reload_counter}] copy failed: {error}");
+            let src = build_dir.join("game.dll");
+            let dst = build_dir.join(format!("game_v{n}.dll"));
+            if std::fs::copy(&src, &dst).is_err() {
                 continue;
             }
 
-            // Communicate the new path and start time to the main thread
-            *pending_reload.lock().unwrap() = Some(PendingReload {
-                path: destination_dll.clone(),
-                started_at,
+            *pending.lock().unwrap() = Some(PendingPatch {
+                path: dst,
+                started_at: started,
             });
             reload_flag.store(true, Ordering::Release);
-
-            // Drain any spurious events that accumulated during the build
-            // (cargo itself can trigger filesystem noise even outside the
-            // watched directory, and the OS may queue metadata-only events).
-            while receiver.try_recv().is_ok() {}
+            while rx.try_recv().is_ok() {}
         }
     });
 }
 
-// ── Window Configuration ──────────────────────────────────────────────────
+// ── Window ────────────────────────────────────────────────────────────────
 
-fn window_configuration() -> Conf {
+fn window_conf() -> Conf {
     Conf {
-        window_title: "mcqueen — Bouncing Ball (edit game/src/lib.rs to hot-reload)".to_owned(),
+        window_title: "mcqueen — single game crate + dll_patch".to_owned(),
         window_width: 800,
         window_height: 600,
         ..Default::default()
@@ -166,87 +120,59 @@ fn window_configuration() -> Conf {
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
-#[macroquad::main(window_configuration)]
+#[macroquad::main(window_conf)]
 async fn main() {
-    // Locate the workspace root (two levels up from standalone crate)
-    let workspace_root = {
-        let executable_path = std::env::current_exe().unwrap();
-        // Navigate from target/debug/standalone.exe up to workspace root
-        let mut path: PathBuf = executable_path;
-        path.pop(); // standalone.exe
-        path.pop(); // debug
-        path.pop(); // target
-        path
+    let ws = {
+        let mut p: PathBuf = std::env::current_exe().unwrap();
+        p.pop(); // exe
+        p.pop(); // debug
+        p.pop(); // target
+        p
     };
+    let build = ws.join("target").join("debug");
 
-    let build_dir = workspace_root.join("target").join("debug");
-
-    // Initial build of the game DLL
-    println!("[init] building game DLL...");
-    let status = Command::new("cargo")
+    // Initial build
+    println!("[init] building game.dll...");
+    if !Command::new("cargo")
         .args(["build", "-p", "game"])
-        .current_dir(&workspace_root)
+        .current_dir(&ws)
         .status()
-        .expect("spawn cargo build");
-    if !status.success() {
-        eprintln!("[init] initial cargo build failed — is the game crate valid?");
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("[init] build failed");
         return;
     }
 
-    // Copy to a versioned name so we NEVER load game.dll directly.
-    // Loading game.dll directly would lock it, preventing cargo from
-    // overwriting it on the next rebuild.
-    let initial_versioned = build_dir.join("game_v0.dll");
-    let source_dll = build_dir.join(GAME_DLL_NAME);
-    std::fs::copy(&source_dll, &initial_versioned).expect("copy game.dll to game_v0.dll");
+    // Copy to versioned name (never load game.dll directly)
+    let base = build.join("game_base.dll");
+    std::fs::copy(build.join("game.dll"), &base).expect("copy");
+    let mut engine = Engine::new(&base);
 
-    // Track pending reload data from the watcher thread
-    let pending_reload: Arc<Mutex<Option<PendingReload>>> = Arc::new(Mutex::new(None));
+    println!("[init] ready. SPACE=bounce. Edit game/src/lib.rs to hot-patch.\n");
 
-    // Create the engine (loads game_v0.dll, leaving game.dll unlocked)
-    let mut engine = Engine::new(&initial_versioned);
-    println!("[init] engine ready. Press SPACE to bounce the ball!\n");
+    let flag = Arc::new(AtomicBool::new(false));
+    let pending: Arc<Mutex<Option<PendingPatch>>> = Arc::new(Mutex::new(None));
+    spawn_watcher(Arc::clone(&flag), Arc::clone(&pending), ws);
 
-    // Shared flag: watcher sets to true when a new DLL is ready
-    let reload_flag = Arc::new(AtomicBool::new(false));
-
-    // Spawn the background file watcher
-    spawn_watcher(
-        Arc::clone(&reload_flag),
-        Arc::clone(&pending_reload),
-        workspace_root.clone(),
-    );
-
-    // ── Main Loop ──────────────────────────────────────────────────────
     loop {
-        let delta_time = get_frame_time();
-
-        // Check for SPACE press -> launch/reset the ball
+        let dt = get_frame_time();
         if is_key_pressed(KeyCode::Space) {
             engine.start();
         }
-
-        // Check for hot-reload signal from the watcher thread
-        if reload_flag.swap(false, Ordering::Acquire) {
-            let pending = pending_reload.lock().unwrap().take();
-            if let Some(reload) = pending {
-                match engine.reload_game(&reload.path) {
-                    Ok(()) => {
-                        let elapsed_ms = reload.started_at.elapsed().as_millis();
-                        println!(
-                            "[main] {} | reload complete — {} ms total\n",
-                            timestamp_now(),
-                            elapsed_ms
-                        );
-                    }
-                    Err(error) => eprintln!("[main] reload failed: {error}\n"),
+        if flag.swap(false, Ordering::Acquire) {
+            if let Some(p) = pending.lock().unwrap().take() {
+                match engine.apply_patch(&p.path) {
+                    Ok(()) => println!(
+                        "[main] {} | patched — {} ms\n",
+                        timestamp_now(),
+                        p.started_at.elapsed().as_millis()
+                    ),
+                    Err(e) => eprintln!("[main] patch failed: {e}\n"),
                 }
             }
         }
-
-        // Advance game + render
-        engine.update(delta_time);
-
+        engine.update(dt);
         next_frame().await;
     }
 }

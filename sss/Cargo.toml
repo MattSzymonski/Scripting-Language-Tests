@@ -1,0 +1,7 @@
+[package]
+name = "sss"
+version = "0.1.0"
+edition = "2024"
+description = "MVP reimplementation of the subsecond hot-patching runtime"
+
+[dependencies]
