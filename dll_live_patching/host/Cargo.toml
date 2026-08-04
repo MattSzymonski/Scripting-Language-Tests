@@ -1,0 +1,20 @@
+[package]
+name = "host"
+version.workspace = true
+edition.workspace = true
+description = "Host executable that loads a cdylib plugin and patches its exported functions via jump-table indirection"
+
+[[bin]]
+name = "host"
+path = "src/main.rs"
+
+[dependencies]
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Foundation",
+] }
