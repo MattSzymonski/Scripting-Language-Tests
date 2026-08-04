@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Current wall-clock time as `HH:MM:SS.mmm`, for timestamping reload log lines.
+fn now() -> String {
+    chrono::Local::now().format("%H:%M:%S%.3f").to_string()
+}
 
 use libloading::{Library, Symbol};
 
@@ -192,11 +198,16 @@ pub fn start() -> HotGame {
     let table = Arc::new(HotFnTable::new());
     let old_libraries: Arc<Mutex<Vec<Library>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let start = Instant::now();
     match build_and_load() {
         Ok(game) => {
             table.patch(&game);
             old_libraries.lock().unwrap().push(game.lib);
-            println!("[hot] game_rs loaded (v{})", PATCH_VERSION.load(Ordering::Relaxed));
+            println!(
+                "[hot] game_rs loaded (v{}) in {:.2?}",
+                PATCH_VERSION.load(Ordering::Relaxed),
+                start.elapsed()
+            );
         }
         Err(e) => eprintln!("[hot] initial build of game_rs failed:\n{e}"),
     }
@@ -206,14 +217,24 @@ pub fn start() -> HotGame {
     let old_libraries_for_watch = old_libraries.clone();
 
     let watcher = crate::watch::spawn(watch_dir, "rs", move || {
-        println!("\n[hot] change detected — rebuilding game_rs...");
+        println!("[hot] [{}] change detected — rebuilding game_rs...", now());
+        let start = Instant::now();
         match build_and_load() {
             Ok(game) => {
                 table_for_watch.patch(&game);
                 old_libraries_for_watch.lock().unwrap().push(game.lib);
-                println!("[hot] PATCHED (v{})", PATCH_VERSION.load(Ordering::Relaxed));
+                println!(
+                    "[hot] [{}] PATCHED (v{}) in {:.2?}",
+                    now(),
+                    PATCH_VERSION.load(Ordering::Relaxed),
+                    start.elapsed()
+                );
             }
-            Err(e) => eprintln!("[hot] rebuild failed:\n{e}"),
+            Err(e) => eprintln!(
+                "[hot] [{}] rebuild failed (after {:.2?}):\n{e}",
+                now(),
+                start.elapsed()
+            ),
         }
     })
     .expect("failed to start game_rs watcher");

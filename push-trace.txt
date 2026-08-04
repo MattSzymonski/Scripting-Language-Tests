@@ -1,0 +1,60 @@
+17:27:02.591799 exec-cmd.c:266          trace: resolved executable dir: C:/Program Files/Git/mingw64/bin
+17:27:02.607310 git.c:502               trace: built-in: git push --progress --porcelain origin HEAD:refs/heads/main
+17:27:02.609317 run-command.c:674       trace: run_command: GIT_DIR=.git git remote-https origin https://github.com/MattSzymonski/Scripting-Language-Tests.git
+17:27:02.609317 run-command.c:946       trace: start_command: git remote-https origin https://github.com/MattSzymonski/Scripting-Language-Tests.git
+17:27:02.648940 exec-cmd.c:266          trace: resolved executable dir: C:/Program Files/Git/mingw64/libexec/git-core
+17:27:02.655941 git.c:812               trace: exec: git-remote-https origin https://github.com/MattSzymonski/Scripting-Language-Tests.git
+17:27:02.657290 run-command.c:674       trace: run_command: git-remote-https origin https://github.com/MattSzymonski/Scripting-Language-Tests.git
+17:27:02.657290 run-command.c:946       trace: start_command: git-remote-https origin https://github.com/MattSzymonski/Scripting-Language-Tests.git
+17:27:02.695819 exec-cmd.c:266          trace: resolved executable dir: C:/Program Files/Git/mingw64/libexec/git-core
+17:27:02.724332 http.c:1033             == Info: Could not find host github.com in the .netrc file; using defaults
+17:27:02.770086 http.c:1033             == Info: Host github.com:443 was resolved.
+17:27:02.770086 http.c:1033             == Info: IPv6: (none)
+17:27:02.770086 http.c:1033             == Info: IPv4: 140.82.121.4
+17:27:02.770086 http.c:1033             == Info:   Trying 140.82.121.4:443...
+17:27:02.793713 http.c:1033             == Info: schannel: disabled automatic use of client certificate
+17:27:02.796713 http.c:1033             == Info: ALPN: curl offers http/1.1
+17:27:02.824714 http.c:1033             == Info: ALPN: server accepted http/1.1
+17:27:02.824714 http.c:1033             == Info: Established connection to github.com (140.82.121.4 port 443) from 192.168.114.119 port 56910 
+17:27:02.824714 http.c:1033             == Info: using HTTP/1.x
+17:27:02.824714 http.c:980              => Send header, 0000000220 bytes (0x000000dc)
+17:27:02.824714 http.c:992              => Send header: GET /MattSzymonski/Scripting-Language-Tests.git/info/refs?service=git-receive-pack HTTP/1.1
+17:27:02.824714 http.c:992              => Send header: Host: github.com
+17:27:02.824714 http.c:992              => Send header: User-Agent: git/2.55.0.windows.2
+17:27:02.824714 http.c:992              => Send header: Accept: */*
+17:27:02.824714 http.c:992              => Send header: Accept-Encoding: deflate, gzip, br, zstd
+17:27:02.824714 http.c:992              => Send header: Pragma: no-cache
+17:27:02.824714 http.c:992              => Send header:
+17:27:02.824714 http.c:1033             == Info: Request completely sent off
+17:27:02.846721 http.c:1033             == Info: schannel: remote party requests renegotiation
+17:27:02.846721 http.c:1033             == Info: schannel: renegotiating SSL/TLS connection
+17:27:02.846721 http.c:1033             == Info: schannel: SSL/TLS connection renegotiated
+17:27:02.846721 http.c:1033             == Info: schannel: remote party requests renegotiation
+17:27:02.846721 http.c:1033             == Info: schannel: renegotiating SSL/TLS connection
+17:27:02.847722 http.c:1033             == Info: schannel: SSL/TLS connection renegotiated
+17:27:02.950344 http.c:980              <= Recv header, 0000000027 bytes (0x0000001b)
+17:27:02.950344 http.c:992              <= Recv header: HTTP/1.1 401 Unauthorized
+17:27:02.950344 http.c:980              <= Recv header, 0000000026 bytes (0x0000001a)
+17:27:02.950344 http.c:992              <= Recv header: Server: GitHub-Babel/3.0
+17:27:02.950344 http.c:980              <= Recv header, 0000000054 bytes (0x00000036)
+17:27:02.950344 http.c:992              <= Recv header: Content-Security-Policy: default-src 'none'; sandbox
+17:27:02.950344 http.c:980              <= Recv header, 0000000041 bytes (0x00000029)
+17:27:02.950344 http.c:992              <= Recv header: Content-Type: text/plain; charset=UTF-8
+17:27:02.950344 http.c:980              <= Recv header, 0000000040 bytes (0x00000028)
+17:27:02.950344 http.c:992              <= Recv header: www-authenticate: Basic realm="GitHub"
+17:27:02.950344 http.c:980              <= Recv header, 0000000020 bytes (0x00000014)
+17:27:02.950344 http.c:992              <= Recv header: Content-Length: 26
+17:27:02.950344 http.c:980              <= Recv header, 0000000037 bytes (0x00000025)
+17:27:02.950344 http.c:992              <= Recv header: Date: Mon, 03 Aug 2026 15:27:03 GMT
+17:27:02.950344 http.c:980              <= Recv header, 0000000023 bytes (0x00000017)
+17:27:02.950344 http.c:992              <= Recv header: X-Frame-Options: DENY
+17:27:02.950344 http.c:980              <= Recv header, 0000000073 bytes (0x00000049)
+17:27:02.950344 http.c:992              <= Recv header: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+17:27:02.950344 http.c:980              <= Recv header, 0000000060 bytes (0x0000003c)
+17:27:02.950344 http.c:992              <= Recv header: X-GitHub-Request-Id: 28A6:2FBCE5:12268ABF:F915454:6A70B346
+17:27:02.950344 http.c:980              <= Recv header, 0000000027 bytes (0x0000001b)
+17:27:02.950344 http.c:992              <= Recv header: x-github-edge-region: fra
+17:27:02.950344 http.c:980              <= Recv header, 0000000002 bytes (0x00000002)
+17:27:02.950344 http.c:992              <= Recv header:
+17:27:02.950344 http.c:1033             == Info: Connection #0 to host github.com:443 left intact
+17:27:02.950344 run-command.c:674       trace: run_command: 'git credential-manager get'

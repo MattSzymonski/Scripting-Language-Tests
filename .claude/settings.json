@@ -1,9 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:news.ycombinator.com)",
-      "Bash(sort -t: -k2 -V)",
-      "Bash(uniq -c -f1)"
+      "Bash(*)",
+      "Read(//tmp/**)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "PowerShell(\\(Get-Content \"z:\\\\OtherProjects\\\\Other\\\\Scripting-Language-Tests\\\\dll_stresstesting\\\\AAA-Scenario.csv\" | Measure-Object -Line\\).Lines)",
+      "Bash(powershell -Command \"Get-Content 'z:\\\\OtherProjects\\\\Other\\\\Scripting-Language-Tests\\\\dll_stresstesting\\\\aaa_scenario\\\\manifest.json' | Select-String '\\\\\"total\\\\\"'\")",
+      "Bash(python analyze_dll.py --help)",
+      "Bash(cargo clean *)",
+      "Bash(taskkill //F //PID 37376)"
     ]
   }
 }
