@@ -77,7 +77,13 @@ fn spawn_watcher(
         let mut watcher = RecommendedWatcher::new(
             move |result: Result<Event, notify::Error>| {
                 if let Ok(event) = result {
-                    if matches!(event.kind, EventKind::Modify(_)) {
+                    // Only react to .rs file modifications (ignore temp files,
+                    // build artifacts, and directory metadata noise).
+                    let is_rust_source = event
+                        .paths
+                        .iter()
+                        .any(|path| path.extension().map(|ext| ext == "rs").unwrap_or(false));
+                    if is_rust_source && matches!(event.kind, EventKind::Modify(_)) {
                         let _ = transmitter.send(());
                     }
                 }
@@ -97,7 +103,7 @@ fn spawn_watcher(
 
         let mut reload_counter: u32 = 0;
 
-        for () in receiver {
+        while let Ok(()) = receiver.recv() {
             // Debounce: wait for edits to settle
             std::thread::sleep(Duration::from_millis(DEBOUNCE_MS));
 
@@ -138,6 +144,11 @@ fn spawn_watcher(
                 started_at,
             });
             reload_flag.store(true, Ordering::Release);
+
+            // Drain any spurious events that accumulated during the build
+            // (cargo itself can trigger filesystem noise even outside the
+            // watched directory, and the OS may queue metadata-only events).
+            while receiver.try_recv().is_ok() {}
         }
     });
 }
@@ -187,8 +198,7 @@ async fn main() {
     // overwriting it on the next rebuild.
     let initial_versioned = build_dir.join("game_v0.dll");
     let source_dll = build_dir.join(GAME_DLL_NAME);
-    std::fs::copy(&source_dll, &initial_versioned)
-        .expect("copy game.dll to game_v0.dll");
+    std::fs::copy(&source_dll, &initial_versioned).expect("copy game.dll to game_v0.dll");
 
     // Track pending reload data from the watcher thread
     let pending_reload: Arc<Mutex<Option<PendingReload>>> = Arc::new(Mutex::new(None));
