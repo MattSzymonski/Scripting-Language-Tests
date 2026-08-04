@@ -204,12 +204,13 @@ pub fn start() -> HotGame {
             table.patch(&game);
             old_libraries.lock().unwrap().push(game.lib);
             println!(
-                "[hot] game_rs loaded (v{}) in {:.2?}",
+                "[hot] [{}] game_rs loaded (v{}) in {:.2?}",
+                now(),
                 PATCH_VERSION.load(Ordering::Relaxed),
                 start.elapsed()
             );
         }
-        Err(e) => eprintln!("[hot] initial build of game_rs failed:\n{e}"),
+        Err(e) => eprintln!("[hot] [{}] initial build of game_rs failed:\n{e}", now()),
     }
 
     let watch_dir = workspace_dir().join("game_rs").join("src");
@@ -217,7 +218,7 @@ pub fn start() -> HotGame {
     let old_libraries_for_watch = old_libraries.clone();
 
     let watcher = crate::watch::spawn(watch_dir, "rs", move || {
-        println!("[hot] [{}] change detected — rebuilding game_rs...", now());
+        println!("\n[hot] [{}] change detected — rebuilding game_rs...", now());
         let start = Instant::now();
         match build_and_load() {
             Ok(game) => {

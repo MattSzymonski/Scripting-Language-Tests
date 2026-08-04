@@ -38,13 +38,18 @@ pub fn spawn(
 
     println!("[watch] watching {} for *.{extension} changes...", dir.display());
 
+    const DEBOUNCE: Duration = Duration::from_millis(300);
+
     std::thread::spawn(move || loop {
+        // Block until the first event of a new burst arrives.
         if rx.recv().is_err() {
             break;
         }
-        // Debounce: drain a burst of events, then let the editor finish writing.
-        while rx.try_recv().is_ok() {}
-        std::thread::sleep(Duration::from_millis(300));
+        // Quiet-period debounce: keep resetting the wait as long as more
+        // events keep arriving (e.g. a raw save followed by a delayed
+        // format-on-save rewrite); only fire once the stream has been
+        // quiet for DEBOUNCE.
+        while rx.recv_timeout(DEBOUNCE).is_ok() {}
         on_change();
     });
 

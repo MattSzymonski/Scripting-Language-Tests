@@ -16,7 +16,7 @@ use crate::api::{key, EngineApi};
 mod config {
     pub const GROUND_HEIGHT: f32 = 96.0;
 
-    pub const BIRD_RADIUS: f32 = 18.0;
+    pub const BIRD_RADIUS: f32 = 228.0;
     pub const GRAVITY: f32 = 1500.0;
     pub const FLAP_VELOCITY: f32 = -470.0;
     pub const BIRD_X: f32 = 120.0;
