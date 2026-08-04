@@ -2,14 +2,31 @@
 name = "host"
 version.workspace = true
 edition.workspace = true
-description = "Host executable that loads a cdylib plugin and patches its exported functions via jump-table indirection"
+description = "Host executable that loads cdylib plugins and patches exported functions via jump-table indirection — Steps 1–3"
 
 [[bin]]
 name = "host"
 path = "src/main.rs"
 
+[features]
+default = []
+pdb = ["dep:pdb"]
+subsecond = ["dep:subsecond", "dep:subsecond-types"]
+
 [dependencies]
 libloading = "0.8"
+
+# Path B — file watching for live rebuilds
+notify = { version = "6", default-features = false, features = [
+    "macos_kqueue",
+] }
+
+# Step 2 — PDB-based symbol discovery (optional)
+pdb = { version = "0.8", optional = true }
+
+# Step 3 — Subsecond runtime integration (optional, requires git)
+subsecond = { version = "0.7", optional = true }
+subsecond-types = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

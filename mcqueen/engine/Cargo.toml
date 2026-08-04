@@ -1,0 +1,9 @@
+[package]
+name = "mini_engine"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal game engine built on macroquad with DLL hot-reloading support"
+
+[dependencies]
+macroquad = "0.4"
+libloading = "0.8"

@@ -1,0 +1,10 @@
+[package]
+name = "game"
+version = "0.1.0"
+edition = "2024"
+description = "Hot-reloadable game DLL — bouncing ball demo"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

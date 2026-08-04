@@ -1,0 +1,165 @@
+// game/src/lib.rs — Bouncing ball game logic
+//
+// REQUIREMENTS
+//   None (no external dependencies beyond core / alloc).
+//
+// DESCRIPTION
+//   Exports start(), update(dt), and get_state() as extern "C" symbols
+//   consumed by mini_engine. The ball falls under gravity and bounces
+//   when SPACE is pressed (start() is called by the engine).
+//
+//   Physics:
+//     - Gravity: constant downward acceleration (pixels/s²).
+//     - Bounce on SPACE: upward velocity impulse.
+//     - Floor collision: bounces with energy loss (coefficient of restitution).
+//     - Wall collisions: bounce with energy loss.
+//
+// USAGE
+//   Built as cdylib, loaded at runtime by mini_engine::GameLibrary.
+//
+// EXAMPLE USAGE
+//   cargo build -p game
+//   standalone.exe      # loads and hot-reloads game.dll
+//
+// --- SCRIPT ---
+
+use std::sync::Mutex;
+
+// ── Ball State ────────────────────────────────────────────────────────────
+
+/// Layout must match mini_engine::BallState exactly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BallState {
+    pub position_x: f32,
+    pub position_y: f32,
+    pub radius: f32,
+    pub color_r: f32,
+    pub color_g: f32,
+    pub color_b: f32,
+    pub color_a: f32,
+}
+
+// ── Internal Physics State ────────────────────────────────────────────────
+
+struct PhysicsState {
+    position_x: f32,
+    position_y: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    radius: f32,
+    /// Whether the ball has been launched at least once.
+    active: bool,
+}
+
+// Global physics state — resets on DLL reload, which is exactly the desired
+// behavior for hot-reload (clean slate on each new compilation).
+static STATE: Mutex<PhysicsState> = Mutex::new(PhysicsState {
+    position_x: 400.0,
+    position_y: 500.0,
+    velocity_x: 0.0,
+    velocity_y: 0.0,
+    radius: 20.0,
+    active: false,
+});
+
+// Simulation constants (adjust and recompile to see live changes!)
+const GRAVITY: f32 = 800.0; // pixels per second²
+const BOUNCE_VELOCITY_Y: f32 = -500.0; // upward impulse on SPACE
+const BOUNCE_VELOCITY_X: f32 = 150.0; // horizontal kick for visual interest
+const RESTITUTION: f32 = 0.7; // energy retained on bounce (0-1)
+const FLOOR_Y: f32 = 580.0; // bottom of the play area
+const CEILING_Y: f32 = 20.0;
+const LEFT_WALL: f32 = 20.0;
+const RIGHT_WALL: f32 = 780.0;
+
+// ── Exported Functions ────────────────────────────────────────────────────
+
+/// Reset the ball to its starting position and apply the bounce impulse.
+/// Called by the engine when SPACE is pressed.
+#[unsafe(no_mangle)]
+pub extern "C" fn start() {
+    let mut state = STATE.lock().unwrap();
+    state.position_x = 400.0;
+    state.position_y = 500.0;
+    state.velocity_x = BOUNCE_VELOCITY_X;
+    state.velocity_y = BOUNCE_VELOCITY_Y;
+    state.active = true;
+}
+
+/// Step the physics simulation by `delta_time` seconds.
+/// Called by the engine every frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn update(delta_time: f32) {
+    let mut state = STATE.lock().unwrap();
+    if !state.active {
+        return;
+    }
+
+    // Clamp delta to avoid physics explosion after lag spikes / breakpoints
+    let clamped_delta = delta_time.min(0.1);
+
+    // Apply gravity
+    state.velocity_y += GRAVITY * clamped_delta;
+
+    // Integrate position
+    state.position_x += state.velocity_x * clamped_delta;
+    state.position_y += state.velocity_y * clamped_delta;
+
+    // Floor collision
+    let bottom = state.position_y + state.radius;
+    if bottom >= FLOOR_Y {
+        state.position_y = FLOOR_Y - state.radius;
+        state.velocity_y = -state.velocity_y.abs() * RESTITUTION;
+        // Stop tiny bounces
+        if state.velocity_y.abs() < 10.0 {
+            state.velocity_y = 0.0;
+        }
+    }
+
+    // Ceiling collision
+    let top = state.position_y - state.radius;
+    if top <= CEILING_Y {
+        state.position_y = CEILING_Y + state.radius;
+        state.velocity_y = state.velocity_y.abs() * RESTITUTION;
+    }
+
+    // Left wall collision
+    let left = state.position_x - state.radius;
+    if left <= LEFT_WALL {
+        state.position_x = LEFT_WALL + state.radius;
+        state.velocity_x = state.velocity_x.abs() * RESTITUTION;
+    }
+
+    // Right wall collision
+    let right = state.position_x + state.radius;
+    if right >= RIGHT_WALL {
+        state.position_x = RIGHT_WALL - state.radius;
+        state.velocity_x = -state.velocity_x.abs() * RESTITUTION;
+    }
+}
+
+/// Return a pointer to a BallState describing the current ball.
+/// The engine reads this every frame to know what to draw.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_state() -> *const BallState {
+    // We leak a BallState onto the heap each frame. This is fine for a demo
+    // — the engine reads it immediately and the leak is tiny (24 bytes/frame
+    // ≈ 1.4 KB/min at 60 FPS). A real implementation would use a static
+    // buffer or write into a caller-provided pointer.
+    let s = STATE.lock().unwrap();
+    let color = if s.active {
+        (1.0_f32, 0.3_f32, 0.3_f32, 1.0_f32) // red-orange when active
+    } else {
+        (0.5_f32, 0.5_f32, 0.5_f32, 1.0_f32) // gray when idle
+    };
+    Box::into_raw(Box::new(BallState {
+        position_x: s.position_x,
+        position_y: s.position_y,
+        radius: s.radius,
+        color_r: color.0,
+        color_g: color.1,
+        color_b: color.2,
+        color_a: color.3,
+    }))
+}

@@ -1,0 +1,19 @@
+[package]
+name = "dll_patch"
+version.workspace = true
+edition.workspace = true
+description = "Reusable DLL live-patching framework for Rust — jump-table-based function redirection with ASLR-aware sentinel resolution"
+license = "MIT OR Apache-2.0"
+keywords = ["hotpatch", "dll", "live-reload", "hot-reload", "jump-table"]
+
+[features]
+default = []
+pdb = ["dep:pdb"]
+rebuild = ["dep:notify"]
+
+[dependencies]
+libloading = "0.8"
+pdb = { version = "0.8", optional = true }
+notify = { version = "6", optional = true, default-features = false, features = [
+    "macos_kqueue",
+] }
