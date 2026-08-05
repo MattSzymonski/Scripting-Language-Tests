@@ -16,7 +16,7 @@ mod bloat_gen;
 /// Only greet changed again — compute & bloat should be SKIPPED now.
 #[unsafe(no_mangle)]
 pub extern "C" fn greet_dll() {
-    println!("  [DLL v12] Second edit — only THIS function recompiled!xxx12211");
+    println!("  [DLL v12] Second edit — only THIS function recompiled!xxx111");
 }
 
 /// Another variant — demonstrates swapping to a different DLL export.
