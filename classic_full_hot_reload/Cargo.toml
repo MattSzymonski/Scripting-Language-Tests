@@ -1,3 +1,3 @@
 [workspace]
-members = ["live_patch", "patch_dll"]
+members = ["host", "game_lib"]
 resolver = "3"

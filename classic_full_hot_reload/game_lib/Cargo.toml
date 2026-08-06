@@ -1,0 +1,10 @@
+[package]
+name = "game_lib"
+version = "0.1.0"
+edition = "2024"
+description = "Game library — compiled to DLL and hot-reloaded by the host"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
