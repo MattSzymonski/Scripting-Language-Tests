@@ -3,15 +3,19 @@
 // Watches game_lib/src/lib.rs for changes.  When a change is detected:
 //   1. cargo build -p game_lib --target-dir target_reload   (recompile)
 //   2. Copy target_reload/debug/game_lib.dll → game_v{N}.dll
-//   3. LoadLibraryW(game_v{N}.dll)
-//   4. GetProcAddress for update + compute
-//   5. Call the new functions on every tick
+//   3. Print DLL diagnostics (size, export count, top exports)
+//   4. LoadLibraryW(game_v{N}.dll)
+//   5. GetProcAddress for update + compute
+//   6. Call the new functions on every tick
 //
 // The old DLL stays loaded (Windows reference counting).
 // DLL names are incremental: game_v1.dll, game_v2.dll, ...
 
 use std::os::windows::ffi::OsStrExt;
 use std::time::Instant;
+
+mod dll_analysis;
+use dll_analysis::inspect_dll;
 
 // ---------------------------------------------------------------------------
 // Windows FFI
@@ -40,6 +44,7 @@ fn file_modified_time(path: &std::path::Path) -> Option<std::time::SystemTime> {
 fn main() {
     let workspace_root = std::env::current_dir().unwrap();
     let game_source = workspace_root.join("game_lib").join("src").join("lib.rs");
+    let test_source = workspace_root.join("game_lib").join("src").join("test.rs");
     let exe_dir = std::env::current_exe()
         .unwrap()
         .parent()
@@ -50,10 +55,12 @@ fn main() {
 
     println!("=== Classic Full Hot Reload ===\n");
     println!("  Watching: {}", game_source.display());
+    println!("  Watching: {}", test_source.display());
     println!("  DLLs go to: {}\\game_vN.dll\n", exe_dir.display());
-    println!("  Edit game_lib/src/lib.rs, save, watch it reload.\n");
+    println!("  Edit game_lib/src/lib.rs (or test.rs), save, watch it reload.\n");
 
     let mut last_source_time = file_modified_time(&game_source);
+    let mut last_test_source_time = file_modified_time(&test_source);
     let mut dll_counter: u64 = 0;
     let mut tick: u32 = 0;
 
@@ -66,6 +73,8 @@ fn main() {
     rebuild_game_lib(&target_dir);
     dll_counter += 1;
     let dll_path = copy_dll(&built_dll, &exe_dir, dll_counter);
+    // --- DLL diagnostics (initial load) ---
+    println!("{}", inspect_dll(&dll_path, &target_dir));
     match load_game_functions(&dll_path) {
         Some((update, compute)) => {
             current_update = Some(update);
@@ -87,13 +96,26 @@ fn main() {
             println!("        compute({}, 3) = {}", tick, result);
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::thread::sleep(std::time::Duration::from_millis(2000));
 
         // --- Check for source changes ---
         let current_time = file_modified_time(&game_source);
-        if current_time != last_source_time {
+        let current_test_time = file_modified_time(&test_source);
+        let source_changed = current_time != last_source_time;
+        let test_changed = current_test_time != last_test_source_time;
+
+        if source_changed || test_changed {
             last_source_time = current_time;
-            println!("\n  ── Source changed (tick {tick}) — rebuilding game_lib... ──");
+            last_test_source_time = current_test_time;
+
+            let which = if source_changed && test_changed {
+                "lib.rs & test.rs"
+            } else if source_changed {
+                "lib.rs"
+            } else {
+                "test.rs"
+            };
+            println!("\n  ── Source changed ({which}, tick {tick}) — rebuilding game_lib... ──");
 
             let start = Instant::now();
             rebuild_game_lib(&target_dir);
@@ -101,6 +123,9 @@ fn main() {
 
             dll_counter += 1;
             let dll_path = copy_dll(&built_dll, &exe_dir, dll_counter);
+
+            // --- DLL diagnostics ---
+            println!("{}", inspect_dll(&dll_path, &target_dir));
 
             print!("  Loading {}... ", dll_path.display());
             let load_start = Instant::now();
