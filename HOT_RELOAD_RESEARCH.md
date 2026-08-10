@@ -1,5 +1,70 @@
 # Hot Reload Bottleneck Research
 
+## Front-end cost: dead code isn't free just because it's cached
+
+The linking analysis below explains the *back-end* (link) cost of unused
+functions.  But there is a **second, separate** cost that exists even when a
+module's `.o` file is byte-for-byte cached and never relinked into anything:
+**parsing and macro expansion re-run on every single build, regardless of what
+changed.**
+
+### The experiment
+
+`classic_full_hot_reload/game_lib` has a `bloat_gen_no_export.rs` module: 5,000
+`pub(crate) fn` functions, never called from anywhere, each containing three
+`format!` calls.  Since the functions are never referenced, dead-code
+elimination strips them from the linked DLL, and the module's `.o` file proved
+byte-identical (verified via `Get-FileHash`) across rebuilds where nothing in
+that file changed. Given that, editing an unrelated file (`test.rs`) and
+rebuilding *should* be nearly instant. It wasn't:
+
+| Configuration | `test.rs`-touch rebuild time |
+|---|---|
+| No bloat module in the crate | **426 ms** |
+| Bloat module present, `format!` replaced with `String::from` | **669 ms** (+243 ms) |
+| Bloat module present, real `format!` calls (as shipped) | **~950 ms** (+520 ms total) |
+
+(All measurements taken with `[profile.dev] debug = 0` correctly applied at
+the **workspace root** `Cargo.toml` -- profile settings in a workspace member's
+own `Cargo.toml` are silently ignored by Cargo.)
+
+### Why: incremental caching only covers the back half of the pipeline
+
+rustc's query-based incremental compilation can skip re-running typeck, MIR
+building, and codegen for a function once it proves (via a fingerprint hash)
+that the function's HIR is unchanged.  But to *compute* that fingerprint, it
+first has to:
+
+1. Tokenize and parse the file
+2. **Fully expand every macro in it** (`format!` included)
+3. Build the HIR
+4. *Then* hash it and compare to the cached fingerprint
+
+There is no way to "peek" at whether a file changed without doing steps 1-3
+first -- the front-end pass over a crate's source is proportional to source
+size and macro complexity on **every build**, no matter how small the edit
+was elsewhere in the crate. Only the back end (steps after fingerprinting)
+benefits from incremental reuse, which is exactly why the `.o` file stayed
+cached while wall-clock time still went up.
+
+This means:
+
+- **+243 ms** comes from simply having 5,000 functions in the crate --
+  every item still needs its HIR parsed and fingerprinted on every build.
+- **+~280 ms** more comes specifically from `format!` -- each macro call
+  expands to multiple AST/HIR nodes (`Arguments::new_v1`, trait resolution
+  for `Display`, etc.), and with 3 calls per function across 5,000 functions
+  that's 15,000 macro expansions repeated on every single build.
+
+### Takeaway
+
+"The linker will strip it" and "the `.o` is cached" are both true and both
+irrelevant to this cost -- it's paid in the compiler **front end**, before
+dead-code elimination or incremental codegen reuse ever come into play. The
+only real fix is to keep such generated/unused bloat **out of the crate**
+that's compiled on every hot-reload cycle (a separate crate, or a
+`#[cfg(feature = "bloat")]` gate that's off by default).
+
 ## The question
 
 When hot-reloading a DLL with thousands of functions, **what is the bottleneck --
