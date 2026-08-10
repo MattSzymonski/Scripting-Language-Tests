@@ -233,11 +233,7 @@ fn inspect_object_relocations(target_dir: &Path) -> String {
         None => return "  .o relocations: (llvm-objdump not found)".into(),
     };
 
-    // Rust incremental compilation stores .o files under:
-    //   target_reload/debug/incremental/game_lib-<hash>/s-<hash>/*.o
-    //
-    // We only need the most recently modified .o — that's the compilation unit
-    // that was just recompiled due to the source edit.
+    // Collect all .o files for the game_lib crate.
     let incremental_dir = target_dir.join("debug").join("incremental");
     let mut object_files: Vec<PathBuf> = Vec::new();
 
@@ -245,7 +241,6 @@ fn inspect_object_relocations(target_dir: &Path) -> String {
         for entry in entries.flatten() {
             let name_str = entry.file_name().to_string_lossy().to_string();
             if name_str.starts_with("game_lib-") && entry.path().is_dir() {
-                // Recursively collect all .o files under this crate's directory.
                 find_files(&entry.path(), "o", &mut object_files);
                 break;
             }
@@ -256,26 +251,64 @@ fn inspect_object_relocations(target_dir: &Path) -> String {
         return "  .o relocations: (.o files not found in incremental dir)".into();
     }
 
-    // Sort by modification time ascending; the last entry is the newest.
-    // Falls back to UNIX_EPOCH for files whose metadata can't be read.
-    object_files.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-    let object_path = object_files.last().unwrap();
+    // Record modification times for all .o files.
+    let file_times: Vec<(&PathBuf, std::time::SystemTime)> = object_files
+        .iter()
+        .filter_map(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| (p, t))
+        })
+        .collect();
 
-    // Run llvm-objdump with both -d (disassemble) and -r (print relocations).
-    // The combined output interleaves relocation entries within their
-    // enclosing function's disassembly, which allows us to determine the
-    // source function for every relocation.
-    let output = match std::process::Command::new(&objdump)
+    // Find the most recent modification time across all .o files.
+    let newest_time = file_times
+        .iter()
+        .map(|(_, t)| *t)
+        .max()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    // Consider any .o file modified within this window of the newest one
+    // as "recently rebuilt" — these are the files cargo just recompiled.
+    let rebuild_window = std::time::Duration::from_secs(2);
+    let rebased_tolerance = newest_time
+        .checked_sub(rebuild_window)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let recently_rebuilt: Vec<&PathBuf> = file_times
+        .iter()
+        .filter(|(_, t)| *t >= rebased_tolerance)
+        .map(|(p, _)| *p)
+        .collect();
+
+    // Analyze each recently-rebuilt .o file and collect results.
+    let mut sections: Vec<String> = Vec::new();
+    for object_path in &recently_rebuilt {
+        sections.push(analyze_object_file(&objdump, object_path));
+    }
+
+    sections.join("\n")
+}
+
+/// Run llvm-objdump -d -r on a single .o file and return the formatted
+/// relocation analysis (summary line, internal tree, external summary).
+fn analyze_object_file(objdump: &Path, object_path: &Path) -> String {
+    let output = match std::process::Command::new(objdump)
         .args(["-d", "-r"])
-        .arg(&object_path)
+        .arg(object_path)
         .output()
     {
         Ok(o) => o,
-        Err(e) => return format!("  .o relocations: (failed to run: {e})"),
+        Err(e) => {
+            return format!(
+                "  .o ({}) relocations: (failed to run: {e})",
+                object_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )
+        }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -292,7 +325,6 @@ fn inspect_object_relocations(target_dir: &Path) -> String {
     let mut call_graph: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     // Track external calls by category for the summary line.
-    // Categories: anon, core, std, alloc, compiler, panic, other.
     let mut external_by_category: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
 
@@ -401,18 +433,29 @@ fn inspect_object_relocations(target_dir: &Path) -> String {
     }
 
     // Build the result: summary line, internal tree, external summary.
-    let mut result = format!(
-        "  .o relocations ({}): total={total}",
-        object_path
+    // Show the parent directory name to disambiguate .o files with the
+    // same filename in different incremental compilation subdirectories.
+    let display_name = {
+        let file_name = object_path
             .file_name()
             .unwrap_or_default()
-            .to_string_lossy(),
-    );
+            .to_string_lossy();
+        if let Some(parent) = object_path.parent().and_then(|p| p.file_name()) {
+            format!("{}/{}", parent.to_string_lossy(), file_name)
+        } else {
+            file_name.to_string()
+        }
+    };
+    let mut result = format!("  .o relocations ({display_name}): total={total}");
 
     // ── Internal links section ──
     result.push_str(&format!("\n    {crate_internal} internal links:"));
 
-    if !call_graph.is_empty() {
+    if call_graph.is_empty() {
+        if crate_internal == 0 {
+            result.push_str("\n      (none — all code in this .o is dead or unreferenced)");
+        }
+    } else {
         // Identify root callers: functions that appear as sources but never
         // as targets of another function in this .o.
         let all_callees: std::collections::HashSet<&String> =

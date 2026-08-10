@@ -12,7 +12,7 @@ pub fn alpha() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn update(tick: i32) {
-    println!("Hedwawddwxxxxaasdswxxlxxlxso");
+    println!("12awwadxd");
     alpha();
     test::alpha();
 }
