@@ -3,5 +3,5 @@ pub fn beta() -> String {
 }
 
 pub fn alpha() {
-    println!("alphaadwdxwasdwadwaaaaaa {}", beta());
+    println!("alphaadwdawdawdxwasawdasdssdwadwaaaaaa {}", beta());
 }

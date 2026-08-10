@@ -8,3 +8,6 @@ description = "Game library — compiled to DLL and hot-reloaded by the host"
 crate-type = ["cdylib"]
 
 [dependencies]
+
+[profile.dev]
+debug = 0
