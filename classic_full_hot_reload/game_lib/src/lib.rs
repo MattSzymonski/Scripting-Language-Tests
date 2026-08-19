@@ -7,12 +7,14 @@ pub fn beta() -> String {
 
 pub fn alpha() {
     println!("alpha {}", beta());
-    println!("alphaww");
+    println!("alphawawdawdw");
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn update(tick: i32) {
-    println!("12aawedwwaswadddwdawawdsdsadxd");
+    println!(
+        "12aawedwwaswadddaawdwdwdawawdawdsddasdadwwasasdawdawsawdawdawddaasdxdadwawd1awdadw2awdawd"
+    );
     alpha();
     test::alpha();
 }

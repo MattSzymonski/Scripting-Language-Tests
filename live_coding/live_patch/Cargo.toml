@@ -1,0 +1,7 @@
+[package]
+name = "live_patch"
+version = "0.1.0"
+edition = "2024"
+description = "Hot-patching runtime — jump-table based function live-reload"
+
+[dependencies]

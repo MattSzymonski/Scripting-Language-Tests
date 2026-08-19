@@ -1,0 +1,10 @@
+[package]
+name = "patch_dll"
+version = "0.1.0"
+edition = "2024"
+description = "Base DLL — exports replacement functions for hot-patching"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

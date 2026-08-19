@@ -1,7 +1,7 @@
 pub fn beta() -> String {
-    "betaaadwdwdwxxwdwdsxx".to_string()
+    "betaaadwdwdwxxwdwdsxxsx".to_string()
 }
 
 pub fn alpha() {
-    println!("alphaadwdawdawdxwasawdasdssdwadwaaaaaa {}", beta());
+    println!("alphaadwdawdawdxwasawdasdssdwadwaaaaaa123awd {}", beta());
 }
