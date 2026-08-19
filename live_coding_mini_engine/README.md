@@ -117,6 +117,23 @@ Press `Escape` to quit.
   bodies), so editing `modules/module_000.rs` or `bloat_gen_no_export.rs` is
   detected; only hot-function body edits are per-function patched, everything
   else triggers a full rebuild.
+- **Functional verification (opt-in)**: when the host process has
+  `LIVE_CODING_VERIFY=1` set, `project_update` prints a **deterministic
+  checksum** derived from the hot functions' outputs with *fixed* inputs
+  (`[verify] checksum=0x...`, printed only when it changes).  Because it is a
+  pure function of the running code, the checksum is stable across frames and
+  across full reloads, but changes the moment a patched function's new body
+  executes — so the test suite can *prove* a patch is live, not just trust
+  the host's log.  The hook (`verification_checksum` /
+  `print_verification_checksum`) is on the infrastructure blocklist (not hot)
+  and self-contained, so it is injected into patch modules too.
+- **End-to-end test suite**: `python run_live_coding_tests.py` builds and
+  launches the host, drives real source edits, and asserts both the host's
+  log markers *and* the live checksum — 14 scenarios covering hot patches
+  (project_update, lib helpers, a middle module function, a leaf, the graph
+  root), full-rebuild triggers (plumbing, const, bloat, new module fn), no-op
+  skips, checksum determinism, and the qualified-key collision case.  Every
+  test restores the sources it touched.
 
 ## Large-project test content
 

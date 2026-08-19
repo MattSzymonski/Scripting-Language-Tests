@@ -194,6 +194,63 @@ fn spawn_default_quads(game_state: &mut GameState, screen_width: f32, screen_hei
     game_state.quad_count = count;
 }
 
+// ---------------------------------------------------------------------------
+// Functional-verification hook (opt-in, test tooling only).  When the host
+// process has LIVE_CODING_VERIFY=1 set, project_update prints a deterministic
+// checksum derived from the HOT functions' outputs with FIXED inputs.  The
+// test suite compares this checksum before/after a patch to PROVE the patched
+// code actually runs - the value changes iff behaviour changes.  Both
+// functions are private lib helpers, so build.rs / the host must keep them on
+// the infrastructure blocklist (they are not hot).
+// ---------------------------------------------------------------------------
+
+/// Deterministic fold of the hot functions' outputs (fixed inputs).
+/// std::hint::black_box stops the compiler constant-folding the calls into
+/// literals, which would freeze the checksum and hide live patches.  Only
+/// references hot functions (which the patch module provides as wrappers) and
+/// the checksum helper below, so it is self-contained when injected.
+fn verification_checksum() -> u32 {
+    let mut checksum: u32 = 0x811C_9DC5;
+    let mut fold = |value: i32| {
+        checksum = checksum.wrapping_mul(0x0100_0193);
+        let bits = value as u32;
+        checksum ^= bits & 0xFF;
+        checksum ^= (bits >> 8) & 0xFF;
+        checksum ^= (bits >> 16) & 0xFF;
+        checksum ^= (bits >> 24) & 0xFF;
+    };
+    fold(std::hint::black_box(get_aaa()));
+    fold(std::hint::black_box(scale_value_0032(7, 2)));
+    fold(std::hint::black_box(modules::run_update(12345)));
+    fold(std::hint::black_box(modules::run_compute(6789, 3)));
+    fold(std::hint::black_box(modules::module_000::tick_000(13)));
+    fold(std::hint::black_box(modules::module_000::compute_000(5, 7)));
+    fold(std::hint::black_box(modules::module_000::sample_000(11)));
+    fold(std::hint::black_box(modules::module_000::scale_value_000(
+        17, 3,
+    )));
+    fold(std::hint::black_box(modules::module_000::offset_value_000(
+        23, 5,
+    )));
+    checksum
+}
+
+/// Print the checksum only when it changes (plus once on first call), so the
+/// log stays quiet between patches and the suite can spot behaviour changes.
+fn print_verification_checksum() {
+    static LAST_VERIFICATION_CHECKSUM: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0xFFFF_FFFF);
+
+    if std::env::var_os("LIVE_CODING_VERIFY").is_none() {
+        return;
+    }
+    let checksum = verification_checksum();
+    let previous = LAST_VERIFICATION_CHECKSUM.swap(checksum, std::sync::atomic::Ordering::Relaxed);
+    if previous != checksum {
+        println!("[verify] checksum=0x{:08X}", checksum);
+    }
+}
+
 fn get_aaa() -> i32 {
     56
 }
@@ -241,4 +298,9 @@ pub extern "C" fn project_update(delta_time: f32) {
         let noise_scale = 1.0 + ((tuning_noise % 47) as f32) / 1000.0;
         quad.y = quad.base_y - quad.jump_phase.sin().abs() * quad.jump_height * noise_scale;
     }
+
+    // Functional-verification hook: prints a deterministic checksum derived
+    // from the hot functions (LIVE_CODING_VERIFY=1 only) so the test suite
+    // can prove patched code actually runs.
+    print_verification_checksum();
 }

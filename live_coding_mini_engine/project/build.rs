@@ -134,7 +134,9 @@ fn main() {
                 || name == "project_resolve_symbol"
                 || name == "resolve_hot_symbol"
                 || name == "state"
-                || name == "spawn_default_quads";
+                || name == "spawn_default_quads"
+                || name == "verification_checksum"
+                || name == "print_verification_checksum";
             if !is_infra {
                 let path = if is_lib_rs {
                     name.clone()

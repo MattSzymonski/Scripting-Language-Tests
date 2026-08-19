@@ -1184,7 +1184,9 @@ fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> 
                 || name == "project_resolve_symbol"
                 || name == "resolve_hot_symbol"
                 || name == "state"
-                || name == "spawn_default_quads";
+                || name == "spawn_default_quads"
+                || name == "verification_checksum"
+                || name == "print_verification_checksum";
             // Skip infrastructure only.  No name-collision check: symbols are
             // keyed by qualified path, so duplicate bare names across scopes
             // (lib `scale_value_003` vs `modules::module_003::scale_value_003`)
@@ -1961,10 +1963,11 @@ impl ProjectSession {
         );
 
         // Skip entirely when the save produced identical content (a no-op
-        // touch / editor re-save) - nothing to patch or rebuild.
+        // touch / editor re-save) - nothing to patch or rebuild.  Tracked is
+        // (key, name, params, body, ret), so the body lives at index 3.
         let anything_changed = tracked
             .iter()
-            .any(|entry| !self.is_cached(&entry.0, &entry.2))
+            .any(|entry| !self.is_cached(&entry.0, &entry.3))
             || stripped_changed;
         if !anything_changed {
             println!("  {}", paint("1;34", "--- decision ---"));
