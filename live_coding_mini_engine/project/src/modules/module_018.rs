@@ -15,8 +15,8 @@ pub fn tick_018(input: i32) -> i32 {
 /// folds in values pulled from other modules' leaf functions.
 pub fn compute_018(x: i32, y: i32) -> i32 {
     let base = x * 3 + y * 5;
-    let scaled = scale_value(base, 11);
-    let offset = offset_value(base, 13);
+    let scaled = scale_value_018(base, 11);
+    let offset = offset_value_018(base, 13);
     let sample_003 = crate::modules::module_003::sample_003(base + 5);
     let sample_009 = crate::modules::module_009::sample_009(base + 11);
     (base + scaled + offset + sample_003 + sample_009) % 100000
@@ -27,19 +27,21 @@ pub fn compute_018(x: i32, y: i32) -> i32 {
 /// every module references this symbol.
 pub fn sample_018(seed: i32) -> i32 {
     let local = (seed * 17 + 18) % 100000;
-    let scaled = scale_value(local, 19);
-    let offset = offset_value(local, 23);
+    let scaled = scale_value_018(local, 19);
+    let offset = offset_value_018(local, 23);
     (local + scaled + offset) % 100000
 }
 
-/// Private helper - scales a value and mixes in a per-module constant.
-fn scale_value(value: i32, multiplier: i32) -> i32 {
+/// Scales a value and mixes in a per-module constant.  Unique name per module
+/// so the host's single `project_resolve_symbol` can find it by name.
+pub fn scale_value_018(value: i32, multiplier: i32) -> i32 {
     (value * multiplier + 18) % 100000
 }
 
-/// Private helper - offsets a value and decorates it with string work so the
-/// compiler has real (non-trivial) code to emit for this module.
-fn offset_value(value: i32, adder: i32) -> i32 {
+/// Offsets a value and decorates it with string work so the compiler has
+/// real (non-trivial) code to emit for this module.  Unique name per module
+/// so the host's single `project_resolve_symbol` can find it by name.
+pub fn offset_value_018(value: i32, adder: i32) -> i32 {
     let decorated = format!("module 18 value: {}", value + adder);
     let uppercase = decorated.to_uppercase();
     let length = uppercase.len() as i32;

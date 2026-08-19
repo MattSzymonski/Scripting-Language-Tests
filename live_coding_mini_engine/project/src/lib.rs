@@ -6,10 +6,12 @@
 // DESCRIPTION
 //   Hot-reloadable game logic ("project") for the mini engine.  Exports
 //   project_set_api (receives the engine's function-pointer table),
-//   project_init (applies the quad settings on every load/reload) and
-//   project_update (called by the engine every frame).  The quad settings
-//   (count, colours, sizes, speeds, jump behaviour) are defined HERE, in the
-//   project - not in the engine.
+//   project_init (applies the quad settings on every load/reload),
+//   project_update (called by the engine every frame) and project_resolve_symbol
+//   (the single address-lookup the host uses to find every hot function -
+//   the module graph itself is plain `pub fn`, not exported).  The quad
+//   settings (count, colours, sizes, speeds, jump behaviour) are defined
+//   HERE, in the project - not in the engine.
 //
 // USAGE
 //   Built automatically by `cargo run -p standalone` from the workspace root.
@@ -104,6 +106,7 @@ static mut API: *const ProjectApi = std::ptr::null();
 struct test {
     internal: i32,
     external: i32,
+    a: i32,
 }
 
 /// Called by the host right after every load/reload with the engine's API
@@ -113,6 +116,25 @@ struct test {
 pub extern "C" fn project_set_api(api: *const ProjectApi) {
     unsafe {
         API = api;
+    }
+}
+
+/// THE single exported entry point the host uses to resolve any hot
+/// function's address by name (instead of exporting every graph function).
+/// Returns the address, or 0 when the name is unknown.
+#[unsafe(no_mangle)]
+#[allow(private_interfaces)]
+pub extern "C" fn project_resolve_symbol(name: *const std::os::raw::c_char) -> usize {
+    if name.is_null() {
+        return 0;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let Ok(name) = name.to_str() else {
+        return 0;
+    };
+    match name {
+        "project_update" => project_update as usize,
+        _ => modules::resolve_hot_symbol(name),
     }
 }
 
@@ -184,7 +206,7 @@ pub extern "C" fn project_update(delta_time: f32) {
     // graph (tick + compute + sample edges) reachable from the hot-reloaded
     // function, so live coding really exercises the large interconnected
     // project.
-    let tick_noise = modules::run_update(game_state.tick as i32) % 10000;
+    let tick_noise = modules::run_update(game_state.tick as i32) % 1000;
     let compute_noise = modules::run_compute(game_state.tick as i32, 3) % 10000;
     let tuning_noise = tick_noise + compute_noise;
 

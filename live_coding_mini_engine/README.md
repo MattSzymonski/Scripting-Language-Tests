@@ -45,8 +45,11 @@ Press `Escape` to quit.
 1. **Startup** — `standalone` builds `project` (`cargo build -p project
    --target-dir target_reload`), copies the DLL to a unique versioned name,
    loads it with `libloading`, hands it the engine's `ProjectApi` table via
-   `project_set_api`, runs `project_init`, and resolves the **base
-   `project_update` address** (this address never changes).
+   `project_set_api`, runs `project_init`, and resolves the address of **every
+   hot function** through the DLL's **single exported `project_resolve_symbol`**
+   entry point (which maps a name to the address of `project_update`,
+   `run_update`, `run_compute`, and all `tick_N`/`compute_N`/`sample_N`/
+   `scale_value_N`/`offset_value_N`).  These become the base symbol table.
 2. **Per frame** — the engine calls the loaded `project_update(dt)`.  The
    project reads the engine-owned `GameState` through the API table and moves
    the quads (drift + bounce + jump).  The engine then renders them with
@@ -55,24 +58,27 @@ Press `Escape` to quit.
    (every `.rs` + `Cargo.toml`) and pushes events to a channel; the render
    loop drains them on the main thread.  The host reads **all** project source
    files (lib.rs + bloat + module graph), so an edit anywhere is detected.
-4. **Leaf function edit** — if *only* the `project_update` body changed, that
-   one function is compiled **standalone** via `rustc` (~250–330 ms on the
-   large project) into a small DLL, and its **prologue in the loaded base DLL
-   is patched in place** (`E9 rel32`, with a trampoline if the target is >2 GB
-   away).  The base DLL stays loaded and the update pointer never changes —
-   true Live Coding.
-5. **Anything else** — a changed module/bloat file, settings, structs,
-   `project_init`, `Cargo.toml` changes trigger a **full `cargo build`**; the
-   fresh DLL is loaded alongside and the **base prologue is re-patched** to it
-   (with a pointer swap as a fallback if the patch fails).  A build error
-   prints the compiler output and the previous code keeps running.
+4. **Per-function patch** — if *only the body* of one or more **hot-exported
+   functions** changed (leaf `project_update` OR a function in the middle of
+   the call graph like `tick_000`, `sample_003`, `scale_value_000`), each one
+   is compiled **standalone** via `rustc` (~200–250 ms) into a small DLL and
+   its **prologue in the loaded base DLL is patched in place** (`E9 rel32`,
+   with a trampoline if the target is >2 GB away).  The base DLL stays loaded
+   and pointers never change — true Live Coding for leaves AND middle
+   functions.
+5. **Anything else** — a changed bloat file, settings, structs,
+   `project_set_api`/`project_init`, a new function, a signature change, or
+   `Cargo.toml` changes trigger a **full `cargo build`**; the fresh DLL is
+   loaded alongside, the base prologue is re-patched to it, and the hot
+   symbol table is re-resolved.  A build error prints the compiler output and
+   the previous code keeps running.
 
 ## Key design points
 
-- **True live coding for `project_update`**: per-function `rustc` compile +
-  in-place prologue patch, exactly like the `live_coding/` runtime.  The
-  window, engine and function pointer never change — only the first 5 bytes
-  of the base `project_update` are rewritten.
+- **True live coding for ANY hot function**: per-function `rustc` compile +
+  in-place prologue patch for leaves AND functions in the middle of the call
+  graph.  The window, engine and function pointers never change — only the
+  first 5 bytes of the patched function's prologue are rewritten.
 - **The game DLL never links macroquad.**  It talks to the engine only through
   the `#[repr(C)]` `ProjectApi` function-pointer table (mirrored
   field-for-field in `project/src/lib.rs`).  This is the same API-table
@@ -80,17 +86,25 @@ Press `Escape` to quit.
 - **Game state is engine-owned** and lives in a heap `Box` at a stable
   address, so it **survives every reload** — quad positions, phases and speeds
   are not reset when code is patched or swapped.
-- **Self-contained leaf modules**: a standalone-compiled `project_update` gets
-  the current project constants, types and helper functions injected, the
-  **whole interconnected module graph inlined** as a nested `mod modules`
-  (so `project_update` can call `modules::run_update(...)` in the leaf too),
-  plus its own `ProjectApi` mirror, `state()` accessor and `project_set_api`
-  export.  If a body references something the standalone module can't provide,
-  the host automatically falls back to a full rebuild.
+- **One exported resolver instead of exporting every function**: the graph
+  functions are plain `pub fn` (clean Rust, no `#[no_mangle]`, no export-table
+  pollution — the DLL exports only `project_set_api`, `project_init`,
+  `project_update` and `project_resolve_symbol`).  The host resolves any hot
+  function's address by calling `project_resolve_symbol(name)`, generated to
+  match every graph function (and mirrored inside each patch DLL).
+- **Patches call back into the base DLL (no dependency islands)**: a patch
+  module contains the changed function's real new body plus a **thin
+  forwarding wrapper for every other hot symbol**, each jumping through a
+  dependency-address table the host fills at load (`project_set_dependencies`,
+  exactly like the `project_set_api` table).  So a patched `project_update`
+  calls the *base* `run_update`, a patched `tick_000` calls the *base*
+  `sample_003`, and patching `sample_003` later affects every caller — the
+  base DLL is the single source of truth and **patches compose**.
 - **Multi-file analysis**: the change detector combines lib.rs + bloat + the
-  module graph into one source stream, so editing `modules/module_000.rs` or
-  `bloat_gen_no_export.rs` is detected (and correctly treated as a full
-  rebuild, since only `project_update` bodies can be leaf-patched).
+  module graph into one source stream (stripping `pub extern` and `pub fn`
+  bodies), so editing `modules/module_000.rs` or `bloat_gen_no_export.rs` is
+  detected; only hot-function body edits are per-function patched, everything
+  else triggers a full rebuild.
 
 ## Large-project test content
 
@@ -109,55 +123,41 @@ The project is deliberately grown to stress the live-coding paths:
 - Regenerate either with `python generate_modules.py [--count N]` and
   `python gen_bloat.py [--count N]` from `live_coding_mini_engine/`.
 
-Measured on the large project: cold build+load ~1.5 s, full rebuild+re-patch
-~1 s, leaf patch-in-place ~250–330 ms.
+Measured on the large project: cold build+load ~0.7 s, full rebuild+re-patch
+~0.6–1.8 s, per-function patch-in-place ~200–250 ms for any hot function
+(project_update, tick_000, sample_003, scale_value_000 — all verified).
 
-## How it works (the Live Coding mechanism)
+## How per-function patching composes (the mechanism)
 
 ```
-base DLL loaded ONCE          patch DLL (freshly compiled)     trampoline (if needed)
-┌─────────────────────┐      ┌──────────────────────┐      ┌────────────────────┐
-│ update, compute     │      │ new compute code     │      │ mov rax, <addr>    │
-│ ...                 │      │ (compiled via rustc) │      │ jmp rax            │
-│ E9 <rel32> ─────────┼─────►│                      │      │                    │
-│ (patched prologue)  │      └──────────────────────┘      └────────────────────┘
-└─────────────────────┘
+base DLL (loaded once, single source of truth)      patch DLL (per changed fn)
+┌────────────────────────────────────────────┐     ┌──────────────────────────────┐
+│ project_update  E9 ──────► (patched)      │     │ project_update  (new body)   │
+│ run_update ──────────────► (wrappers)     │     │   calls modules::run_update │
+│ tick_000     E9 ──────► (patched)         │     │   ──► wrapper ──► base addr  │
+│ sample_003   E9 ──────► (patched)         │◄────┼─ dependency table (usize[])  │
+└────────────────────────────────────────────┘     └──────────────────────────────┘
 ```
 
-1. **Startup** — the base DLL is copied to a unique temp path and loaded with
-   `LoadLibraryW`; `update` and `compute` are resolved into **typed `HotFn`
-   wrappers** (no wrapper, no jump table).  The host hands the DLL its service
-   table (`set_services`) so game code can reach **host-owned state** that
-   survives every patch and reload.
-
-2. **Edit** — you change code anywhere in `patch_dll/` and save.
-
-3. **Detect** — the loop content-hashes every watched file every 800 ms.
-
-4. **Compile** — a changed leaf function is extracted (with a lexically-aware
-   mini-lexer that ignores strings/comments) and compiled to a tiny standalone
-   DLL via `rustc` in ~160–200 ms.
-
-5. **Patch** — all other threads are suspended, `VirtualProtect` makes the
+1. **Startup** — the base DLL is loaded once and every hot-exported function's
+   address is resolved by name into the host's symbol table.
+2. **Edit a hot function** — its new body is compiled standalone; every OTHER
+   hot function in the patch module becomes a forwarding wrapper that jumps
+   through the dependency table to the base DLL's copy.
+3. **Patch** — all other threads are suspended, `VirtualProtect` makes the
    original function's page writable, the first 5 bytes become `E9 <rel32>`.
    If the new code is further than ±2 GB away, a cached **trampoline**
    (absolute `jmp rax`) is used.  The instruction cache is flushed and page
    protection restored, then threads resume.
-
-6. **Redirect** — the next call through the ORIGINAL function pointer jumps to
-   the new code.  Everything that held a pointer to the old function is now
-   running the new implementation.
-
-7. **New functions** — a function that did not exist in the base DLL is
-   compiled, loaded, and **registered by name** (with its ABI signature) in a
-   symbol registry, then resolvable via `resolve_symbol("name")` — the Rust
-   equivalent of UE Live Coding's "add a new function live".
-
-8. **Anything else** — structs, internal helpers, other files, or a leaf that
-   references crate internals triggers a **full `cargo build`**; the fresh DLL
-   is copied to a unique temp path, loaded **alongside** the old one, the
-   host's pointers are swapped, and the old DLL is freed.  A failed build
-   never unloads anything — the game keeps running the last good code.
+4. **Composition** — because every patched function calls back into the base
+   DLL, patching `tick_000` then `sample_003` (which `tick_000` calls) works:
+   the patched `tick_000`'s wrapper hits the base `sample_003`, whose prologue
+   now points at the new code.  Patches stack without rebuilding each other.
+5. **Non-hot changes** — new functions, signature changes, structs/consts,
+   bloat, `project_set_api`/`project_init` or `Cargo.toml` edits trigger a
+   **full `cargo build`** + load-alongside; the base prologue is re-patched to
+   the fresh DLL and the symbol table is re-resolved.  A failed build never
+   unloads anything — the game keeps running the last good code.
 
 ## What makes this different from the jump-table approach
 

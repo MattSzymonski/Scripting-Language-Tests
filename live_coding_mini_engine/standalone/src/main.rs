@@ -354,6 +354,24 @@ fn find_extern_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize>
     None
 }
 
+/// Find `pub fn ` (a plain public function, NOT `pub extern`) at or after
+/// `from`, mask-aware.  `pub(crate) fn` and `pub extern "C" fn` do not match
+/// the literal `pub fn ` marker.
+fn find_pub_fn_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize> {
+    let marker = b"pub fn ";
+    let n = bytes.len();
+    let mut i = from;
+    while i + marker.len() <= n {
+        if &bytes[i..i + marker.len()] == marker
+            && mask[i..i + marker.len()].iter().all(|&is_code| is_code)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Lexically-aware extractor: `pub extern "C" fn NAME(params) [-> Ret] { body }`.
 /// Returns `Vec<(name, params, body, return_type)>`.
 fn extract_function_bodies(source: &str) -> Vec<(String, String, String, String)> {
@@ -365,6 +383,94 @@ fn extract_function_bodies(source: &str) -> Vec<(String, String, String, String)
     let n = bytes.len();
 
     while let Some(start) = find_extern_marker(bytes, &mask, i) {
+        let name_start = start + marker_total;
+        let mut name_end = name_start;
+        while name_end < n && bytes[name_end] != b'(' {
+            name_end += 1;
+        }
+        let name = source[name_start..name_end].trim().to_string();
+
+        let mut paren_depth = 0u32;
+        let mut params_end = 0usize;
+        let mut j = name_end;
+        let mut found_open = false;
+        while j < n {
+            if mask[j] {
+                if bytes[j] == b'(' {
+                    paren_depth += 1;
+                    found_open = true;
+                } else if bytes[j] == b')' {
+                    paren_depth -= 1;
+                    if found_open && paren_depth == 0 {
+                        params_end = j;
+                        break;
+                    }
+                }
+            }
+            j += 1;
+        }
+        let params = source[name_end + 1..params_end].trim().to_string();
+
+        let mut k = params_end + 1;
+        let mut body_open = 0usize;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                body_open = k;
+                break;
+            }
+            k += 1;
+        }
+        let ret_section = &source[params_end + 1..body_open];
+        let ret_type = if let Some(arrow) = ret_section.find("->") {
+            ret_section[arrow + 2..]
+                .trim()
+                .split(|c: char| c.is_whitespace() || c == '{')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        let mut depth = 1u32;
+        let mut body_end = 0usize;
+        let mut b = body_open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = b;
+                        break;
+                    }
+                }
+            }
+            b += 1;
+        }
+        let body = source[body_open + 1..body_end].trim().to_string();
+
+        results.push((name, params, body, ret_type));
+        i = body_end + 1;
+    }
+
+    results
+}
+
+/// Lexically-aware extractor for plain `pub fn NAME(params) [-> Ret] { body }`
+/// (the module-graph hot functions, which are NOT exported - the host finds
+/// them through `project_resolve_symbol` instead).  Returns
+/// `Vec<(name, params, body, return_type)>`.
+fn extract_public_functions(source: &str) -> Vec<(String, String, String, String)> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let marker_total = b"pub fn ".len();
+    let mut results = Vec::new();
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    while let Some(start) = find_pub_fn_marker(bytes, &mask, i) {
         let name_start = start + marker_total;
         let mut name_end = name_start;
         while name_end < n && bytes[name_end] != b'(' {
@@ -491,6 +597,74 @@ fn strip_extern_bodies(source: &str) -> String {
 
     result.push_str(&source[i..]);
     result
+}
+
+/// Like `strip_extern_bodies` but also strips plain `pub fn` bodies, so the
+/// hot module-graph functions count as "body-only" changes too.  Private
+/// helpers (`fn state`, `fn spawn_default_quads`) and `pub(crate)` items keep
+/// their bodies, so editing them is correctly treated as a full rebuild.
+fn strip_hot_bodies(source: &str) -> String {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let mut result = String::new();
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    loop {
+        let next_extern = find_extern_marker(bytes, &mask, i);
+        let next_pub = find_pub_fn_marker(bytes, &mask, i);
+        let start = match (next_extern, next_pub) {
+            (Some(extern_start), Some(pub_start)) => Some(extern_start.min(pub_start)),
+            (Some(extern_start), None) => Some(extern_start),
+            (None, Some(pub_start)) => Some(pub_start),
+            (None, None) => None,
+        };
+        let Some(start) = start else {
+            result.push_str(&source[i..]);
+            return result;
+        };
+        result.push_str(&source[i..start]);
+
+        let mut open: Option<usize> = None;
+        let mut k = start;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                open = Some(k);
+                break;
+            }
+            k += 1;
+        }
+        let Some(open) = open else {
+            result.push_str(&source[start..]);
+            return result;
+        };
+        result.push_str(&source[start..=open]);
+
+        let mut depth = 1u32;
+        let mut close: Option<usize> = None;
+        let mut b = open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(b);
+                        break;
+                    }
+                }
+            }
+            b += 1;
+        }
+        match close {
+            Some(close) => i = close + 1,
+            None => {
+                result.push_str(&source[open + 1..]);
+                return result;
+            }
+        }
+    }
 }
 
 /// Extract every top-level `const` declaration from `source` as trimmed
@@ -806,64 +980,267 @@ fn extract_top_level_functions(source: &str) -> Vec<String> {
     functions
 }
 
-/// Build a `mod modules { ... }` block for the leaf module by inlining the
-/// project's `modules.rs` fan-out and every `modules/module_*.rs` file into a
-/// single nested module.  The module files reference each other through
-/// `crate::modules::module_NNN::...`, which resolves correctly because the
-/// leaf crate root defines `mod modules` at the top level.
-fn build_modules_block(project_sources: &[(PathBuf, String)]) -> String {
-    let modules_rs = project_sources
-        .iter()
-        .find(|(path, _)| path.file_name().map_or(false, |name| name == "modules.rs"));
-    let Some((_, modules_content)) = modules_rs else {
-        return String::new();
-    };
-
-    // name -> content for every modules/module_NNN.rs file.
-    let module_files: std::collections::HashMap<String, &str> = project_sources
-        .iter()
-        .filter(|(path, _)| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map_or(false, |name| name.starts_with("module_") && name.ends_with(".rs"))
-        })
-        .map(|(path, content)| {
-            let name = path.file_name().unwrap().to_str().unwrap().to_string();
-            (name, content.as_str())
-        })
-        .collect();
-
-    let mut inlined = String::new();
-    for line in modules_content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("pub mod ") {
-            if let Some(module_name) = rest.strip_suffix(';') {
-                if let Some(module_content) = module_files.get(&format!("{module_name}.rs")) {
-                    inlined.push_str(&format!("pub mod {module_name} {{\n{module_content}\n}}\n"));
-                    continue;
-                }
-            }
-        }
-        inlined.push_str(line);
-        inlined.push('\n');
-    }
-
-    format!("mod modules {{\n{inlined}}}")
+/// A single hot-reloadable exported function, with the module scope it lives
+/// in (so the patch module can rebuild the same call-graph shape as stubs).
+struct HotSymbol {
+    name: String,
+    params: String,
+    body: String,
+    ret: String,
+    /// "top" for lib.rs, "modules" for modules.rs, "modules::module_003" for
+    /// a module file.
+    scope: String,
+    /// Position in the canonical symbol list == index into the dependency
+    /// address table the host hands every patch DLL.
+    index: usize,
 }
 
-/// Build a self-contained Rust module for a standalone-compiled
-/// `project_update`: lib.rs consts + types + helper functions, plus the
-/// inlined module graph, plus the ABI mirrors and the new body.
-fn build_patch_module_source(
-    lib_source: &str,
-    project_sources: &[(PathBuf, String)],
+/// Collect every hot-reloadable function in canonical order: lib.rs
+/// (project_update, exported), modules.rs (run_update/run_compute) and each
+/// module file (tick/compute/sample/scale/offset), the latter being plain
+/// `pub fn` found through the single `project_resolve_symbol` export.
+/// project_set_api / project_init / project_resolve_symbol are load-time
+/// plumbing, not hot - they never appear here.
+fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> {
+    let mut symbols = Vec::new();
+    for (path, content) in project_sources {
+        let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        let scope = match file_name {
+            "lib.rs" => "top".to_string(),
+            "modules.rs" => "modules".to_string(),
+            name if name.starts_with("module_") && name.ends_with(".rs") => {
+                let stem = &name[..name.len() - 3]; // strip ".rs"
+                format!("modules::{stem}")
+            }
+            _ => continue,
+        };
+        // lib.rs hot functions are exported (`pub extern "C"`); graph
+        // functions are plain `pub fn` (found through the resolver).
+        let extracted = if scope == "top" {
+            extract_function_bodies(content)
+        } else {
+            extract_public_functions(content)
+        };
+        for (name, params, body, ret) in extracted {
+            if name == "project_set_api"
+                || name == "project_init"
+                || name == "project_resolve_symbol"
+                || name == "resolve_hot_symbol"
+            {
+                continue;
+            }
+            let index = symbols.len();
+            symbols.push(HotSymbol {
+                name,
+                params,
+                body,
+                ret,
+                scope: scope.clone(),
+                index,
+            });
+        }
+    }
+    symbols
+}
+
+/// Resolve a hot function's address in a loaded DLL by name, through the
+/// DLL's single exported `project_resolve_symbol` entry point (returns 0 for
+/// unknown names, which we treat as `None`).
+fn resolve_symbol_address(library: &Library, name: &str) -> Option<usize> {
+    let resolver: Symbol<extern "C" fn(*const std::os::raw::c_char) -> usize> =
+        unsafe { library.get(b"project_resolve_symbol").ok()? };
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let address = unsafe { resolver(c_name.as_ptr()) };
+    if address == 0 {
+        None
+    } else {
+        Some(address)
+    }
+}
+
+/// Split `x: i32, y: i32` into ([types], [names]).
+fn parse_params(params: &str) -> (Vec<String>, Vec<String>) {
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut types = Vec::new();
+    let mut names = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(colon) = part.find(':') {
+            names.push(part[..colon].trim().to_string());
+            types.push(part[colon + 1..].trim().to_string());
+        }
+    }
+    (types, names)
+}
+
+/// Rust path expression that reaches a hot symbol inside the patch module
+/// (used by the generated resolver): `project_update`, `modules::run_update`,
+/// `modules::module_000::tick_000`, ...
+fn symbol_path(symbol: &HotSymbol) -> String {
+    match symbol.scope.as_str() {
+        "top" => symbol.name.clone(),
+        "modules" => format!("modules::{}", symbol.name),
+        _ => format!("{}::{}", symbol.scope, symbol.name),
+    }
+}
+
+/// A plain `pub fn` declaration (NOT exported - the host finds it through
+/// `project_resolve_symbol`): either the real new body of the changed
+/// function, or a forwarding wrapper that jumps through the dependency table
+/// to the base DLL's copy of the function.
+fn build_hot_definition(
+    name: &str,
     params: &str,
+    ret: &str,
     body: &str,
+    index: usize,
+    changed_name: &str,
 ) -> String {
+    let ret_suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" -> {ret}")
+    };
+    if name == changed_name {
+        // The changed function gets its real new body.
+        format!("pub fn {name}({params}){ret_suffix} {{\n{body}\n}}\n")
+    } else {
+        // Everyone else becomes a thin wrapper that calls back into the base
+        // DLL through the dependency table, so the changed function's call
+        // sites (unchanged text) still resolve, but execute the base code.
+        let (types, names) = parse_params(params);
+        let type_list = types.join(", ");
+        let fn_type = if ret.is_empty() {
+            format!("fn({type_list})")
+        } else {
+            format!("fn({type_list}) -> {ret}")
+        };
+        let call_args = names.join(", ");
+        format!(
+            "pub fn {name}({params}){ret_suffix} {{\n    let function: {fn_type} = unsafe {{ std::mem::transmute::<usize, {fn_type}>(crate::dependency_address({index})) }};\n    function({call_args})\n}}\n"
+        )
+    }
+}
+
+/// Build the `mod modules { ... }` skeleton for the patch module: every hot
+/// symbol that lives inside the module graph becomes a forwarding wrapper
+/// (or the real body if it is the changed function), preserving the exact
+/// `crate::modules::module_NNN::...` paths the function bodies use.
+fn build_modules_skeleton(symbols: &[HotSymbol], changed_name: &str) -> String {
+    // Group the graph symbols by module, preserving first-seen order.
+    let mut module_order: Vec<String> = Vec::new();
+    let mut module_defs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut root_defs: Vec<String> = Vec::new();
+    for symbol in symbols {
+        let definition = build_hot_definition(
+            &symbol.name,
+            &symbol.params,
+            &symbol.ret,
+            &symbol.body,
+            symbol.index,
+            changed_name,
+        );
+        if symbol.scope == "modules" {
+            root_defs.push(definition);
+        } else if let Some(module_name) = symbol.scope.strip_prefix("modules::") {
+            if !module_defs.contains_key(module_name) {
+                module_order.push(module_name.to_string());
+            }
+            module_defs
+                .entry(module_name.to_string())
+                .or_default()
+                .push(definition);
+        }
+        // scope == "top" is handled by the caller.
+    }
+
+    let mut block = String::from("mod modules {\n");
+    for definition in &root_defs {
+        block.push_str(definition);
+        block.push('\n');
+    }
+    for module_name in &module_order {
+        block.push_str(&format!("    pub mod {module_name} {{\n"));
+        for definition in &module_defs[module_name] {
+            block.push_str("    ");
+            block.push_str(definition);
+        }
+        block.push_str("    }\n");
+    }
+    block.push_str("}\n");
+    block
+}
+
+/// Build the self-contained module for one changed hot function: lib.rs
+/// consts/types/helpers + ABI mirrors + state() + project_set_api, a
+/// dependency-address table (filled by the host at load) and forwarding
+/// wrappers for every OTHER hot function, so the changed function's call
+/// sites (unchanged text) resolve to stubs that jump back into the base DLL.
+/// This is what makes patching a function "in the middle" of the call graph
+/// take effect: the base prologue of the changed function is patched to this
+/// module, and its calls hit the base (whose own prologues can be patched
+/// later too - patches compose).
+fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_name: &str) -> String {
     let consts = extract_top_level_consts(lib_source).join("\n");
     let type_definitions = extract_top_level_type_definitions(lib_source).join("\n");
     let helper_functions = extract_top_level_functions(lib_source).join("\n");
-    let modules_block = build_modules_block(project_sources);
+    let modules_skeleton = build_modules_skeleton(symbols, changed_name);
+
+    // The top-level hot symbol (project_update): real body if it is the one
+    // being patched, otherwise a forwarding wrapper.
+    let top_definitions = symbols
+        .iter()
+        .filter(|symbol| symbol.scope == "top")
+        .map(|symbol| {
+            build_hot_definition(
+                &symbol.name,
+                &symbol.params,
+                &symbol.ret,
+                &symbol.body,
+                symbol.index,
+                changed_name,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The patch module needs its own `project_resolve_symbol` so the host can
+    // resolve the (non-exported) hot functions by name in the patch DLL too.
+    let resolver_arms = symbols
+        .iter()
+        .map(|symbol| {
+            format!(
+                "        {:?} => {} as usize,",
+                symbol.name,
+                symbol_path(symbol)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let resolver = format!(
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn project_resolve_symbol(name: *const std::os::raw::c_char) -> usize {{\n\
+         \x20   if name.is_null() {{\n\
+         \x20       return 0;\n\
+         \x20   }}\n\
+         \x20   let name = unsafe {{ std::ffi::CStr::from_ptr(name) }};\n\
+         \x20   let Ok(name) = name.to_str() else {{ return 0; }};\n\
+         \x20   match name {{\n\
+         {resolver_arms}\n\
+         \x20       _ => 0,\n\
+         \x20   }}\n\
+         }}\n"
+    );
+
     format!(
         "#![allow(dead_code)]\n\
          use std::ffi::c_void;\n\
@@ -873,8 +1250,6 @@ fn build_patch_module_source(
          {type_definitions}\n\
          \n\
          {helper_functions}\n\
-         \n\
-         {modules_block}\n\
          \n\
          #[repr(C)]\n\
          struct ProjectApi {{\n\
@@ -923,10 +1298,23 @@ fn build_patch_module_source(
              }}\n\
          }}\n\
          \n\
+         static mut DEPENDENCY_ADDRESSES: *const usize = std::ptr::null();\n\
+         \n\
          #[no_mangle]\n\
-         pub extern \"C\" fn project_update({params}) {{\n\
-         {body}\n\
-         }}\n"
+         #[allow(private_interfaces)]\n\
+         pub extern \"C\" fn project_set_dependencies(addresses: *const usize) {{\n\
+             unsafe {{ DEPENDENCY_ADDRESSES = addresses; }}\n\
+         }}\n\
+         \n\
+         fn dependency_address(index: usize) -> usize {{\n\
+             unsafe {{ *DEPENDENCY_ADDRESSES.add(index) }}\n\
+         }}\n\
+         \n\
+         {top_definitions}\n\
+         \n\
+         {modules_skeleton}\n\
+         \n\
+         {resolver}\n"
     )
 }
 
@@ -971,14 +1359,22 @@ fn build_and_load_full(api: &ProjectApi) -> Result<(Library, usize), String> {
 /// Owns the loaded project and applies live-coding changes.
 struct ProjectSession {
     api: ProjectApi,
-    /// Address of `project_update` in the base DLL - the prologue target that
-    /// every patch rewrites.  Never changes after the initial load.
+    /// Address of `project_update` in the very first base DLL - the engine
+    /// pointer target.  Its prologue is what every full reload re-patches.
     base_update_address: Option<usize>,
+    /// Canonical hot-symbol names (order == dependency-table order), from the
+    /// most recently fully-built DLL.
+    hot_names: Vec<String>,
+    /// Base-DLL addresses of the hot symbols (same order).  These are the
+    /// prologue-patch targets AND the dependency table handed to every patch
+    /// DLL, so a patched function calls back into the base (single source of
+    /// truth).
+    base_symbols: Vec<usize>,
     /// How many change events have been processed (for logging).
     change_count: u64,
     /// Cache of the last applied function bodies: (name, params, body, ret).
     cached_funcs: Vec<(String, String, String, String)>,
-    /// lib.rs with extern bodies stripped, to detect non-body changes.
+    /// All source with extern bodies stripped, to detect non-body changes.
     stripped_source: String,
     /// Every loaded library (base copy, full builds, patch DLLs), retained so
     /// an in-flight call never hits unmapped memory.
@@ -990,6 +1386,8 @@ impl ProjectSession {
         Self {
             api,
             base_update_address: None,
+            hot_names: Vec::new(),
+            base_symbols: Vec::new(),
             change_count: 0,
             cached_funcs: Vec::new(),
             stripped_source: String::new(),
@@ -1017,30 +1415,51 @@ impl ProjectSession {
         let build_start = Instant::now();
         match build_and_load_full(&self.api) {
             Ok((library, update_address)) => {
+                // Resolve every hot symbol's address in this freshly loaded
+                // DLL - these are the prologue-patch targets AND the
+                // dependency table handed to future patch DLLs.
+                let project_sources = collect_project_sources();
+                let hot_symbols = collect_hot_symbols(&project_sources);
+                self.hot_names = hot_symbols
+                    .iter()
+                    .map(|symbol| symbol.name.clone())
+                    .collect();
+                self.base_symbols = hot_symbols
+                    .iter()
+                    .map(|symbol| resolve_symbol_address(&library, &symbol.name).unwrap_or(0))
+                    .collect();
+
                 self.base_update_address = Some(update_address);
                 engine.set_project_update(update_address as *mut ());
                 self.retained_libraries.push(library);
 
                 // Seed the change cache from the current sources so the first
                 // edit is diffed against the initial state.  The combined
-                // source covers lib.rs + bloat + the module graph.
-                let project_sources = collect_project_sources();
+                // source covers lib.rs + bloat + the module graph; we cache
+                // both the hot symbols and the plumbing exports.
                 let combined_source: String = project_sources
                     .iter()
                     .map(|(_, content)| content.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.stripped_source = strip_extern_bodies(&combined_source);
-                let funcs = extract_function_bodies(&combined_source);
-                for entry in &funcs {
+                self.stripped_source = strip_hot_bodies(&combined_source);
+                for entry in &extract_function_bodies(&combined_source) {
                     self.upsert_cached(entry.clone());
                 }
+                for symbol in &hot_symbols {
+                    self.upsert_cached((
+                        symbol.name.clone(),
+                        symbol.params.clone(),
+                        symbol.body.clone(),
+                        symbol.ret.clone(),
+                    ));
+                }
                 println!(
-                    "{} cold build + load in {} - {} source file(s), {} extern function(s) cached",
+                    "{} cold build + load in {} - {} source file(s), {} hot symbol(s) cached",
                     hot_prefix(),
                     paint_green(&format!("{:?}", build_start.elapsed())),
                     paint_bright_cyan(&project_sources.len().to_string()),
-                    paint_bright_cyan(&funcs.len().to_string())
+                    paint_bright_cyan(&hot_symbols.len().to_string())
                 );
 
                 println!(
@@ -1053,28 +1472,36 @@ impl ProjectSession {
         }
     }
 
-    /// Compile `project_update`'s new body standalone and patch its prologue
-    /// in the loaded base DLL - true Live Coding.
-    fn try_leaf_patch(
+    /// Compile one changed hot function standalone and patch its prologue in
+    /// the loaded base DLL - true Live Coding, for leaves AND functions in
+    /// the middle of the call graph.
+    fn try_patch_function(
         &mut self,
         lib_source: &str,
         project_sources: &[(PathBuf, String)],
-        params: &str,
-        body: &str,
+        changed: &HotSymbol,
     ) -> Result<(), String> {
         let consts = extract_top_level_consts(lib_source);
         println!(
             "    {} {}",
-            paint("1;35", "--- leaf patch (true Live Coding) ---"),
-            paint_magenta("per-function compile + prologue patch")
+            paint("1;35", "--- per-function patch (true Live Coding) ---"),
+            paint_magenta("standalone compile + prologue patch")
         );
         println!(
             "    injecting {} project const(s) into the self-contained module",
             paint_bright_cyan(&consts.len().to_string())
         );
-        println!("    params=({params})  body={} chars", paint_cyan(&body.len().to_string()));
+        println!(
+            "    patching {}  params=({})  body={} chars",
+            paint_bright_cyan(&changed.name),
+            changed.params,
+            paint_cyan(&changed.body.len().to_string())
+        );
 
-        let module_source = build_patch_module_source(lib_source, project_sources, params, body);
+        // Rebuild the canonical symbol list from the current source so the
+        // patch module's dependency-table indices match the host's table.
+        let symbols = collect_hot_symbols(project_sources);
+        let module_source = build_patch_module_source(lib_source, &symbols, &changed.name);
         let compile_start = Instant::now();
         println!("    rustc compiling standalone module...");
         let dll_path = mini_engine::patch::compile_rust_source(&module_source, "project_patch")?;
@@ -1087,38 +1514,48 @@ impl ProjectSession {
         let library = unsafe { Library::new(&dll_path) }
             .map_err(|e| format!("LoadLibrary failed: {e}"))?;
 
-        // Hand the API table to the patch DLL and copy out the update address
-        // (the Symbol borrows `library`, so drop it before moving `library`).
-        let new_address: usize = unsafe {
+        unsafe {
+            // Hand the API table (engine services) and the dependency table
+            // (base-DLL addresses of every hot symbol) to the patch DLL.
             let set_api: Symbol<extern "C" fn(*const ProjectApi)> = library
                 .get(b"project_set_api")
                 .map_err(|e| format!("project_set_api missing: {e}"))?;
             set_api(&self.api);
 
-            let update: Symbol<ProjectUpdateFn> = library
-                .get(b"project_update")
-                .map_err(|e| format!("project_update missing: {e}"))?;
-            *update as usize
+            let set_dependencies: Symbol<extern "C" fn(*const usize)> = library
+                .get(b"project_set_dependencies")
+                .map_err(|e| format!("project_set_dependencies missing: {e}"))?;
+            set_dependencies(self.base_symbols.as_ptr());
         };
 
-        let base = self.base_update_address.ok_or("no base project loaded")?;
+        let new_address = resolve_symbol_address(&library, &changed.name)
+            .ok_or_else(|| format!("{} not exported by patch DLL", changed.name))?;
+        let old_address = self
+            .base_symbols
+            .get(changed.index)
+            .copied()
+            .ok_or_else(|| format!("no base address for {}", changed.name))?;
+
         println!(
-            "    base project_update @ {}  (pointer stays unchanged)",
-            paint_cyan(&format!("{base:#x}"))
+            "    base {} @ {}  (pointer stays unchanged)",
+            paint_cyan(&changed.name),
+            paint_cyan(&format!("{old_address:#x}"))
         );
         println!(
-            "    new  project_update @ {}  (patch DLL)",
+            "    new  {} @ {}  (patch DLL)",
+            paint_cyan(&changed.name),
             paint_cyan(&format!("{new_address:#x}"))
         );
         println!("    patching base prologue...");
-        unsafe { mini_engine::patch::patch_prologue(base, new_address)? };
+        unsafe { mini_engine::patch::patch_prologue(old_address, new_address)? };
 
         self.retained_libraries.push(library);
         println!(
             "{} {}",
             hot_prefix(),
             paint_bright_green(&format!(
-                "PATCHED IN PLACE in {:?} - base DLL untouched, pointer unchanged",
+                "PATCHED {} IN PLACE in {:?} - base DLL untouched, pointer unchanged",
+                changed.name,
                 compile_start.elapsed()
             ))
         );
@@ -1137,9 +1574,23 @@ impl ProjectSession {
         println!("    cargo build -p project --target-dir target_reload ...");
         match build_and_load_full(&self.api) {
             Ok((library, update_address)) => {
+                // The fresh DLL is the new base: re-resolve every hot symbol's
+                // address in it (prologue-patch targets + dependency table).
+                let project_sources = collect_project_sources();
+                let hot_symbols = collect_hot_symbols(&project_sources);
+                self.hot_names = hot_symbols
+                    .iter()
+                    .map(|symbol| symbol.name.clone())
+                    .collect();
+                self.base_symbols = hot_symbols
+                    .iter()
+                    .map(|symbol| resolve_symbol_address(&library, &symbol.name).unwrap_or(0))
+                    .collect();
+
                 println!(
-                    "    build + load OK in {}",
-                    paint_green(&format!("{:?}", build_start.elapsed()))
+                    "    build + load OK in {} ({} hot symbols)",
+                    paint_green(&format!("{:?}", build_start.elapsed())),
+                    paint_bright_cyan(&hot_symbols.len().to_string())
                 );
                 println!(
                     "    fresh project_update @ {}",
@@ -1228,19 +1679,33 @@ impl ProjectSession {
             .map(|(_, content)| content.clone())
             .unwrap_or_default();
 
-        let funcs = extract_function_bodies(&combined_source);
-        let stripped = strip_extern_bodies(&combined_source);
+        let extern_funcs = extract_function_bodies(&combined_source);
+        let stripped = strip_hot_bodies(&combined_source);
         let stripped_changed = stripped != self.stripped_source;
         self.stripped_source = stripped;
 
-        // Per-function diff against the cache.
+        // Canonical hot symbols (project_update + the module-graph pub fns).
+        let symbols = collect_hot_symbols(&project_sources);
+
+        // Per-function diff against the cache.  Tracked = plumbing exports
+        // (set_api/init/resolve_symbol) + all hot symbols.
+        let mut tracked: Vec<(String, String, String, String)> = extern_funcs.clone();
+        for symbol in &symbols {
+            tracked.push((
+                symbol.name.clone(),
+                symbol.params.clone(),
+                symbol.body.clone(),
+                symbol.ret.clone(),
+            ));
+        }
         println!("  {}", paint("1;34", "--- source analysis ---"));
         println!(
-            "  {} source file(s), {} extern function(s) extracted:",
+            "  {} source file(s), {} hot function(s) + {} plumbing export(s) tracked:",
             paint_bright_cyan(&project_sources.len().to_string()),
-            paint_bright_cyan(&funcs.len().to_string())
+            paint_bright_cyan(&symbols.len().to_string()),
+            paint_bright_cyan(&extern_funcs.len().to_string())
         );
-        for entry in &funcs {
+        for entry in &tracked {
             let status_text = if self.is_cached(&entry.0, &entry.2) {
                 "unchanged"
             } else {
@@ -1277,7 +1742,7 @@ impl ProjectSession {
 
         // Skip entirely when the save produced identical content (a no-op
         // touch / editor re-save) - nothing to patch or rebuild.
-        let anything_changed = funcs
+        let anything_changed = tracked
             .iter()
             .any(|entry| !self.is_cached(&entry.0, &entry.2))
             || stripped_changed;
@@ -1290,52 +1755,52 @@ impl ProjectSession {
             return;
         }
 
-        // Locate project_update and decide whether ONLY its body changed.
-        let update_entry = funcs.iter().find(|entry| entry.0 == "project_update").cloned();
-        let update_changed = update_entry
-            .as_ref()
-            .map(|entry| !self.is_cached(&entry.0, &entry.2))
-            .unwrap_or(true);
-        let signature_changed = match (
-            update_entry.as_ref(),
-            self.cached_funcs.iter().find(|cached| cached.0 == "project_update"),
-        ) {
-            (Some(new_entry), Some(old_entry)) => {
-                new_entry.1 != old_entry.1 || new_entry.3 != old_entry.3
-            }
-            _ => false,
-        };
-        let other_changed = funcs
+        // Decide: which hot functions changed, and is ANYTHING non-hot-patchable?
+        let changed_symbols: Vec<&HotSymbol> = symbols
             .iter()
-            .any(|entry| entry.0 != "project_update" && !self.is_cached(&entry.0, &entry.2));
+            .filter(|symbol| !self.is_cached(&symbol.name, &symbol.body))
+            .collect();
 
-        let leaf_eligible = update_changed
-            && !other_changed
-            && !stripped_changed
-            && !signature_changed;
+        // Anything below forces a full rebuild:
+        //  - non-body content (consts / structs / attrs / module decls / bloat)
+        //  - plumbing functions (project_set_api / project_init / resolver)
+        //  - the hot function set changed shape (new/removed module functions)
+        let plumbing_changed = extern_funcs.iter().any(|entry| {
+            (entry.0 == "project_set_api"
+                || entry.0 == "project_init"
+                || entry.0 == "project_resolve_symbol")
+                && !self.is_cached(&entry.0, &entry.2)
+        });
+        let structure_changed = symbols.len() != self.hot_names.len()
+            || symbols.iter().any(|symbol| !self.hot_names.contains(&symbol.name));
+
+        let full_rebuild_needed = stripped_changed || plumbing_changed || structure_changed;
 
         println!("  {}", paint("1;34", "--- decision ---"));
-        if leaf_eligible {
+        if !full_rebuild_needed && !changed_symbols.is_empty() {
+            let names = changed_symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             println!(
-                "  {} (only project_update body changed)",
-                paint_bright_green("leaf-eligible = TRUE")
+                "  {} ({}) -> per-function prologue patch",
+                paint_bright_green("hot-patchable = TRUE"),
+                paint_bright_cyan(&names)
             );
         } else {
             let mut reasons = Vec::new();
-            if !update_changed {
-                reasons.push("project_update body unchanged");
-            }
-            if other_changed {
-                reasons.push("another function changed");
+            if changed_symbols.is_empty() {
+                reasons.push("no hot function body changed");
             }
             if stripped_changed {
-                reasons.push("non-body content changed (structs/consts/static)");
+                reasons.push("non-body content changed (structs/consts/static/bloat)");
             }
-            if signature_changed {
-                reasons.push("project_update signature changed");
+            if plumbing_changed {
+                reasons.push("plumbing function changed (project_set_api / project_init)");
             }
-            if update_entry.is_none() {
-                reasons.push("project_update missing from source");
+            if structure_changed {
+                reasons.push("hot function set changed shape (new/removed)");
             }
             let reasons = if reasons.is_empty() {
                 "no actionable change".to_string()
@@ -1344,35 +1809,46 @@ impl ProjectSession {
             };
             println!(
                 "  {} ({reasons}) -> {}",
-                paint_bright_yellow("leaf-eligible = FALSE"),
+                paint_bright_yellow("hot-patchable = FALSE"),
                 paint_bright_yellow("full rebuild")
             );
         }
 
-        // Fast path: only the project_update body changed - patch in place.
-        if leaf_eligible {
-            if let Some(entry) = &update_entry {
-                match self.try_leaf_patch(&lib_source, &project_sources, &entry.1, &entry.2) {
-                    Ok(()) => {
-                        self.upsert_cached(entry.clone());
-                        return;
-                    }
+        // Fast path: every changed function is hot - patch each prologue in
+        // place (composing naturally: each patch calls back into the base).
+        if !full_rebuild_needed && !changed_symbols.is_empty() {
+            let mut patched_all = true;
+            for changed in &changed_symbols {
+                match self.try_patch_function(&lib_source, &project_sources, changed) {
+                    Ok(()) => {}
                     Err(errors) => {
-                        // e.g. the body references something the standalone
-                        // module can't provide - fall back to a full build.
                         eprintln!(
-                            "{} standalone leaf compile failed - falling back:\n{}",
+                            "{} per-function patch failed for {} - falling back to a full rebuild:\n{}",
                             hot_prefix(),
+                            changed.name,
                             paint_red(&errors)
                         );
+                        patched_all = false;
+                        break;
                     }
                 }
             }
+            if patched_all {
+                for changed in &changed_symbols {
+                    self.upsert_cached((
+                        changed.name.clone(),
+                        changed.params.clone(),
+                        changed.body.clone(),
+                        changed.ret.clone(),
+                    ));
+                }
+                return;
+            }
         }
 
-        // Full-rebuild fallback (or the change wasn't leaf-eligible).
-        if self.full_reload(engine, "leaf-ineligible or leaf patch failed") {
-            for entry in &funcs {
+        // Full-rebuild fallback (or the change wasn't hot-patchable).
+        if self.full_reload(engine, "hot-ineligible or per-function patch failed") {
+            for entry in &tracked {
                 self.upsert_cached(entry.clone());
             }
         }
