@@ -97,9 +97,35 @@ fn workspace_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The project's main source file.
-fn project_source_path() -> PathBuf {
-    workspace_dir().join("project").join("src").join("lib.rs")
+/// The project's source directory (contains lib.rs, modules.rs, modules/...).
+fn project_src_dir() -> PathBuf {
+    workspace_dir().join("project").join("src")
+}
+
+/// Read every `.rs` file under `project/src` (recursively) so the live-coding
+/// analysis covers the whole project - lib.rs plus the bloat and module-graph
+/// files - not just the main file.
+fn collect_project_sources() -> Vec<(PathBuf, String)> {
+    let mut sources = Vec::new();
+    let mut stack = vec![project_src_dir()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().map_or(false, |ext| ext == "rs") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    sources.push((path, content));
+                }
+            }
+        }
+    }
+    // Stable order (lib.rs first, then modules.rs, then modules/...).
+    sources.sort_by(|(path_a, _), (path_b, _)| path_a.cmp(path_b));
+    sources
 }
 
 /// Run `cargo build -p project` and return the built DLL path on success, or
@@ -681,11 +707,163 @@ fn extract_top_level_type_definitions(source: &str) -> Vec<String> {
     definitions
 }
 
+/// Extract every top-level (non-extern) `fn` definition from `source`,
+/// skipping strings/comments and the template-provided `state` helper.  Used
+/// to inject the project's helper functions into a standalone-compiled body.
+fn extract_top_level_functions(source: &str) -> Vec<String> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut functions = Vec::new();
+    let mut i = 0usize;
+
+    while i < n {
+        // A real `fn` declaration starts a statement (preceded by a
+        // delimiter), never the `fn` inside a type or expression.
+        let prev_is_delimiter = i == 0
+            || matches!(
+                bytes[i - 1],
+                b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
+            );
+        let is_word_start = prev_is_delimiter
+            && mask[i]
+            && bytes[i..].starts_with(b"fn ")
+            && (i + 3 >= n || !(bytes[i + 3].is_ascii_alphanumeric() || bytes[i + 3] == b'_'));
+        if is_word_start {
+            // Skip extern functions (`pub extern "C" fn ...`): the declaration
+            // text between the previous statement boundary and `fn` contains
+            // the `extern` keyword.
+            let mut decl_start = i;
+            while decl_start > 0
+                && !matches!(bytes[decl_start - 1], b'\n' | b'\r' | b';' | b'{' | b'}')
+            {
+                decl_start -= 1;
+            }
+            let declaration = &source[decl_start..i];
+            let is_extern = declaration.split_whitespace().any(|word| word == "extern");
+
+            if !is_extern {
+                // Function name (after the whitespace following `fn`).
+                let mut name_start = i + 2;
+                while name_start < n
+                    && (bytes[name_start] == b' '
+                        || bytes[name_start] == b'\t'
+                        || bytes[name_start] == b'\n')
+                {
+                    name_start += 1;
+                }
+                let mut name_end = name_start;
+                while name_end < n
+                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+                {
+                    name_end += 1;
+                }
+                let name = &source[name_start..name_end];
+
+                // Skip `state` - the generated module defines its own.
+                if name != "state" {
+                    // Capture the full definition: `fn` keyword up to the
+                    // matching closing brace.
+                    let mut open = 0usize;
+                    let mut j = i;
+                    while j < n {
+                        if mask[j] && bytes[j] == b'{' {
+                            open = j;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if open > i {
+                        let mut depth = 1u32;
+                        let mut close = 0usize;
+                        let mut b = open + 1;
+                        while b < n {
+                            if mask[b] {
+                                if bytes[b] == b'{' {
+                                    depth += 1;
+                                } else if bytes[b] == b'}' {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        close = b;
+                                        break;
+                                    }
+                                }
+                            }
+                            b += 1;
+                        }
+                        if close > open {
+                            functions.push(source[i..=close].trim().to_string());
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    functions
+}
+
+/// Build a `mod modules { ... }` block for the leaf module by inlining the
+/// project's `modules.rs` fan-out and every `modules/module_*.rs` file into a
+/// single nested module.  The module files reference each other through
+/// `crate::modules::module_NNN::...`, which resolves correctly because the
+/// leaf crate root defines `mod modules` at the top level.
+fn build_modules_block(project_sources: &[(PathBuf, String)]) -> String {
+    let modules_rs = project_sources
+        .iter()
+        .find(|(path, _)| path.file_name().map_or(false, |name| name == "modules.rs"));
+    let Some((_, modules_content)) = modules_rs else {
+        return String::new();
+    };
+
+    // name -> content for every modules/module_NNN.rs file.
+    let module_files: std::collections::HashMap<String, &str> = project_sources
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map_or(false, |name| name.starts_with("module_") && name.ends_with(".rs"))
+        })
+        .map(|(path, content)| {
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            (name, content.as_str())
+        })
+        .collect();
+
+    let mut inlined = String::new();
+    for line in modules_content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("pub mod ") {
+            if let Some(module_name) = rest.strip_suffix(';') {
+                if let Some(module_content) = module_files.get(&format!("{module_name}.rs")) {
+                    inlined.push_str(&format!("pub mod {module_name} {{\n{module_content}\n}}\n"));
+                    continue;
+                }
+            }
+        }
+        inlined.push_str(line);
+        inlined.push('\n');
+    }
+
+    format!("mod modules {{\n{inlined}}}")
+}
+
 /// Build a self-contained Rust module for a standalone-compiled
-/// `project_update`, from the project's current constants plus the new body.
-fn build_patch_module_source(project_source: &str, params: &str, body: &str) -> String {
-    let consts = extract_top_level_consts(project_source).join("\n");
-    let type_definitions = extract_top_level_type_definitions(project_source).join("\n");
+/// `project_update`: lib.rs consts + types + helper functions, plus the
+/// inlined module graph, plus the ABI mirrors and the new body.
+fn build_patch_module_source(
+    lib_source: &str,
+    project_sources: &[(PathBuf, String)],
+    params: &str,
+    body: &str,
+) -> String {
+    let consts = extract_top_level_consts(lib_source).join("\n");
+    let type_definitions = extract_top_level_type_definitions(lib_source).join("\n");
+    let helper_functions = extract_top_level_functions(lib_source).join("\n");
+    let modules_block = build_modules_block(project_sources);
     format!(
         "#![allow(dead_code)]\n\
          use std::ffi::c_void;\n\
@@ -693,6 +871,10 @@ fn build_patch_module_source(project_source: &str, params: &str, body: &str) -> 
          {consts}\n\
          \n\
          {type_definitions}\n\
+         \n\
+         {helper_functions}\n\
+         \n\
+         {modules_block}\n\
          \n\
          #[repr(C)]\n\
          struct ProjectApi {{\n\
@@ -839,21 +1021,27 @@ impl ProjectSession {
                 engine.set_project_update(update_address as *mut ());
                 self.retained_libraries.push(library);
 
-                // Seed the change cache from the current source so the first
-                // edit is diffed against the initial state.
-                if let Ok(source) = std::fs::read_to_string(project_source_path()) {
-                    self.stripped_source = strip_extern_bodies(&source);
-                    let funcs = extract_function_bodies(&source);
-                    for entry in &funcs {
-                        self.upsert_cached(entry.clone());
-                    }
-                    println!(
-                        "{} cold build + load in {} - {} extern function(s) cached",
-                        hot_prefix(),
-                        paint_green(&format!("{:?}", build_start.elapsed())),
-                        paint_bright_cyan(&funcs.len().to_string())
-                    );
+                // Seed the change cache from the current sources so the first
+                // edit is diffed against the initial state.  The combined
+                // source covers lib.rs + bloat + the module graph.
+                let project_sources = collect_project_sources();
+                let combined_source: String = project_sources
+                    .iter()
+                    .map(|(_, content)| content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.stripped_source = strip_extern_bodies(&combined_source);
+                let funcs = extract_function_bodies(&combined_source);
+                for entry in &funcs {
+                    self.upsert_cached(entry.clone());
                 }
+                println!(
+                    "{} cold build + load in {} - {} source file(s), {} extern function(s) cached",
+                    hot_prefix(),
+                    paint_green(&format!("{:?}", build_start.elapsed())),
+                    paint_bright_cyan(&project_sources.len().to_string()),
+                    paint_bright_cyan(&funcs.len().to_string())
+                );
 
                 println!(
                     "{} base project.dll loaded - jumping quads are live (project_update @ {})",
@@ -867,8 +1055,14 @@ impl ProjectSession {
 
     /// Compile `project_update`'s new body standalone and patch its prologue
     /// in the loaded base DLL - true Live Coding.
-    fn try_leaf_patch(&mut self, source: &str, params: &str, body: &str) -> Result<(), String> {
-        let consts = extract_top_level_consts(source);
+    fn try_leaf_patch(
+        &mut self,
+        lib_source: &str,
+        project_sources: &[(PathBuf, String)],
+        params: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let consts = extract_top_level_consts(lib_source);
         println!(
             "    {} {}",
             paint("1;35", "--- leaf patch (true Live Coding) ---"),
@@ -880,7 +1074,7 @@ impl ProjectSession {
         );
         println!("    params=({params})  body={} chars", paint_cyan(&body.len().to_string()));
 
-        let module_source = build_patch_module_source(source, params, body);
+        let module_source = build_patch_module_source(lib_source, project_sources, params, body);
         let compile_start = Instant::now();
         println!("    rustc compiling standalone module...");
         let dll_path = mini_engine::patch::compile_rust_source(&module_source, "project_patch")?;
@@ -1011,23 +1205,39 @@ impl ProjectSession {
             println!("  {} {}", paint_cyan("file changed:"), path.display());
         }
 
-        let source = match std::fs::read_to_string(project_source_path()) {
-            Ok(source) => source,
-            Err(e) => {
-                eprintln!("{} cannot read project source: {}", hot_prefix(), paint_red(&e.to_string()));
-                return;
-            }
-        };
+        // Read the whole project (lib.rs + bloat + module graph) so edits in
+        // any file are detected, and pull out lib.rs separately for the leaf
+        // module's consts/types/helpers.
+        let project_sources = collect_project_sources();
+        if project_sources.is_empty() {
+            eprintln!(
+                "{} cannot read project sources under {}",
+                hot_prefix(),
+                paint_red(&project_src_dir().display().to_string())
+            );
+            return;
+        }
+        let combined_source: String = project_sources
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lib_source = project_sources
+            .iter()
+            .find(|(path, _)| path.file_name().map_or(false, |name| name == "lib.rs"))
+            .map(|(_, content)| content.clone())
+            .unwrap_or_default();
 
-        let funcs = extract_function_bodies(&source);
-        let stripped = strip_extern_bodies(&source);
+        let funcs = extract_function_bodies(&combined_source);
+        let stripped = strip_extern_bodies(&combined_source);
         let stripped_changed = stripped != self.stripped_source;
         self.stripped_source = stripped;
 
         // Per-function diff against the cache.
         println!("  {}", paint("1;34", "--- source analysis ---"));
         println!(
-            "  {} extern function(s) extracted:",
+            "  {} source file(s), {} extern function(s) extracted:",
+            paint_bright_cyan(&project_sources.len().to_string()),
             paint_bright_cyan(&funcs.len().to_string())
         );
         for entry in &funcs {
@@ -1142,7 +1352,7 @@ impl ProjectSession {
         // Fast path: only the project_update body changed - patch in place.
         if leaf_eligible {
             if let Some(entry) = &update_entry {
-                match self.try_leaf_patch(&source, &entry.1, &entry.2) {
+                match self.try_leaf_patch(&lib_source, &project_sources, &entry.1, &entry.2) {
                     Ok(()) => {
                         self.upsert_cached(entry.clone());
                         return;

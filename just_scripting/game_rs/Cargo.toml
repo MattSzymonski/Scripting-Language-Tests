@@ -1,9 +1,0 @@
-[package]
-name = "game_rs"
-version = "0.1.0"
-edition = "2021"
-description = "Flappy Bird game logic — pure Rust, no .NET hosting"
-
-[dependencies]
-mini_engine = { path = "../engine" }
-macroquad = "0.4"

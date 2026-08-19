@@ -22,6 +22,11 @@
 
 use std::ffi::c_void;
 
+// Auto-generated bloat (dead code, compile volume only) and the
+// interconnected module graph (reachable from project_update below).
+mod bloat_gen_no_export;
+mod modules;
+
 /// Mirror of `mini_engine::ProjectApi` - must match field-for-field, in order.
 #[repr(C)]
 struct ProjectApi {
@@ -85,7 +90,7 @@ const QUAD_VELOCITY_X_STEP: f32 = 23.0;
 /// Jump oscillation speed of the first quad (rad/s).
 const QUAD_INITIAL_JUMP_SPEED: f32 = 1.6;
 /// Extra jump oscillation speed added per quad index (rad/s).
-const QUAD_JUMP_SPEED_STEP: f32 = 0.35;
+const QUAD_JUMP_SPEED_STEP: f32 = 1.35;
 /// Jump height of the first quad (px).
 const QUAD_INITIAL_JUMP_HEIGHT: f32 = 40.0;
 /// Extra jump height added per quad index (px).
@@ -174,6 +179,15 @@ pub extern "C" fn project_update(delta_time: f32) {
 
     let screen_width = unsafe { ((*API).screen_width)() };
 
+    // Fan out into the interconnected module graph and fold the results into
+    // a small "tuning noise" that perturbs the jump.  This makes the whole
+    // graph (tick + compute + sample edges) reachable from the hot-reloaded
+    // function, so live coding really exercises the large interconnected
+    // project.
+    let tick_noise = modules::run_update(game_state.tick as i32) % 10000;
+    let compute_noise = modules::run_compute(game_state.tick as i32, 3) % 10000;
+    let tuning_noise = tick_noise + compute_noise;
+
     for quad in game_state.quads[..game_state.quad_count].iter_mut() {
         // Half the quad's width, used to centre it on its x position.
         let half_width = quad.w * QUAD_HALF_SIZE_FACTOR;
@@ -185,8 +199,11 @@ pub extern "C" fn project_update(delta_time: f32) {
             quad.x = quad.x.clamp(half_width, screen_width - half_width - 2.0);
         }
 
-        // Jump: y oscillates between base_y and base_y - jump_height.
+        // Jump: y oscillates between base_y and base_y - jump_height, scaled
+        // slightly by the module-graph noise so the interconnected code has a
+        // visible (but subtle) effect on the animation.
         quad.jump_phase += quad.jump_speed * delta_time;
-        quad.y = quad.base_y - quad.jump_phase.sin().abs() * quad.jump_height;
+        let noise_scale = 1.0 + ((tuning_noise % 41) as f32) / 1000.0;
+        quad.y = quad.base_y - quad.jump_phase.sin().abs() * quad.jump_height * noise_scale;
     }
 }

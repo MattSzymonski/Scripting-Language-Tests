@@ -11,7 +11,11 @@ game code, in the style of UE Live Coding / Live++:
   the project's `update` function every frame.
 - **project** — the game logic, compiled as a **cdylib**.  Exports
   `project_set_api` (receives the engine's API table) and `project_update`
-  (called by the engine each frame).  Animates the quads so they jump.
+  (called by the engine each frame).  Animates the quads so they jump.  It is
+  also the **large-project test case**: an auto-generated interconnected
+  module graph (`modules.rs` + `modules/module_*.rs`, reachable from
+  `project_update`) plus ~2000 auto-generated bloat functions
+  (`bloat_gen_no_export.rs`, compile volume only).
 
 ```
 ┌──────────── standalone (exe) ────────────┐
@@ -47,18 +51,21 @@ Press `Escape` to quit.
    project reads the engine-owned `GameState` through the API table and moves
    the quads (drift + bounce + jump).  The engine then renders them with
    macroquad.
-3. **Edit** — `notify` watches `project/` (`.rs` + `Cargo.toml`) and pushes
-   events to a channel; the render loop drains them on the main thread.
+3. **Edit** — `notify` watches the whole `project/` directory recursively
+   (every `.rs` + `Cargo.toml`) and pushes events to a channel; the render
+   loop drains them on the main thread.  The host reads **all** project source
+   files (lib.rs + bloat + module graph), so an edit anywhere is detected.
 4. **Leaf function edit** — if *only* the `project_update` body changed, that
-   one function is compiled **standalone** via `rustc` (~170 ms) into a small
-   DLL, and its **prologue in the loaded base DLL is patched in place**
-   (`E9 rel32`, with a trampoline if the target is >2 GB away).  The base DLL
-   stays loaded and the update pointer never changes — true Live Coding.
-5. **Anything else** — settings, structs, `project_init`, `Cargo.toml`
-   changes trigger a **full `cargo build`**; the fresh DLL is loaded
-   alongside and the **base prologue is re-patched** to it (with a pointer
-   swap as a fallback if the patch fails).  A build error prints the compiler
-   output and the previous code keeps running.
+   one function is compiled **standalone** via `rustc` (~250–330 ms on the
+   large project) into a small DLL, and its **prologue in the loaded base DLL
+   is patched in place** (`E9 rel32`, with a trampoline if the target is >2 GB
+   away).  The base DLL stays loaded and the update pointer never changes —
+   true Live Coding.
+5. **Anything else** — a changed module/bloat file, settings, structs,
+   `project_init`, `Cargo.toml` changes trigger a **full `cargo build`**; the
+   fresh DLL is loaded alongside and the **base prologue is re-patched** to it
+   (with a pointer swap as a fallback if the patch fails).  A build error
+   prints the compiler output and the previous code keeps running.
 
 ## Key design points
 
@@ -74,10 +81,36 @@ Press `Escape` to quit.
   address, so it **survives every reload** — quad positions, phases and speeds
   are not reset when code is patched or swapped.
 - **Self-contained leaf modules**: a standalone-compiled `project_update` gets
-  the current project constants injected plus its own `ProjectApi` mirror,
-  `state()` accessor and `project_set_api` export, so the body compiles on its
-  own.  If a body references something the standalone module can't provide,
+  the current project constants, types and helper functions injected, the
+  **whole interconnected module graph inlined** as a nested `mod modules`
+  (so `project_update` can call `modules::run_update(...)` in the leaf too),
+  plus its own `ProjectApi` mirror, `state()` accessor and `project_set_api`
+  export.  If a body references something the standalone module can't provide,
   the host automatically falls back to a full rebuild.
+- **Multi-file analysis**: the change detector combines lib.rs + bloat + the
+  module graph into one source stream, so editing `modules/module_000.rs` or
+  `bloat_gen_no_export.rs` is detected (and correctly treated as a full
+  rebuild, since only `project_update` bodies can be leaf-patched).
+
+## Large-project test content
+
+The project is deliberately grown to stress the live-coding paths:
+
+- `modules.rs` + `modules/module_000.rs`..`module_019.rs` — a 20-module
+  **interconnected graph** (ring topology): the root fans out into every
+  module, each `tick_N`/`compute_N` pulls leaf samples from two *other*
+  modules, and `project_update` folds both `run_update` and `run_compute`
+  into a small noise term that perturbs the quads' jump — so every module is
+  reachable from the hot-reloaded function.
+- `bloat_gen_no_export.rs` — 2000 `pub(crate)` bloat functions with string
+  work and arithmetic loops (no `format!`, per the macro-expansion lesson).
+  They are dead code on the hot path, so they only add full-rebuild cost; the
+  leaf patch never sees them.
+- Regenerate either with `python generate_modules.py [--count N]` and
+  `python gen_bloat.py [--count N]` from `live_coding_mini_engine/`.
+
+Measured on the large project: cold build+load ~1.5 s, full rebuild+re-patch
+~1 s, leaf patch-in-place ~250–330 ms.
 
 ## How it works (the Live Coding mechanism)
 
