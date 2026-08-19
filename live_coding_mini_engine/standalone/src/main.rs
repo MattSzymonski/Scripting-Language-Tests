@@ -372,6 +372,44 @@ fn find_pub_fn_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize>
     None
 }
 
+/// Find a private `fn ` declaration (no `pub` / `extern` prefix, e.g.
+/// `fn get_aaa`), mask-aware.  Used to make lib.rs helper functions hot.
+fn find_private_fn_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize> {
+    let marker = b"fn ";
+    let n = bytes.len();
+    let mut i = from;
+    while i + marker.len() <= n {
+        if &bytes[i..i + marker.len()] == marker
+            && mask[i..i + marker.len()].iter().all(|&is_code| is_code)
+        {
+            let prev_ok = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
+                );
+            if prev_ok {
+                // The declaration before `fn` must not contain `pub`/`extern`
+                // (that would be `pub fn`, `pub(crate) fn` or `extern "C" fn`).
+                let mut decl_start = i;
+                while decl_start > 0
+                    && !matches!(bytes[decl_start - 1], b'\n' | b'\r' | b';' | b'{' | b'}')
+                {
+                    decl_start -= 1;
+                }
+                let declaration = String::from_utf8_lossy(&bytes[decl_start..i]);
+                let mut words = declaration.split_whitespace();
+                let has_pub = words.clone().any(|word| word.contains("pub"));
+                let has_extern = words.any(|word| word.contains("extern"));
+                if !has_pub && !has_extern {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Lexically-aware extractor: `pub extern "C" fn NAME(params) [-> Ret] { body }`.
 /// Returns `Vec<(name, params, body, return_type)>`.
 fn extract_function_bodies(source: &str) -> Vec<(String, String, String, String)> {
@@ -546,11 +584,109 @@ fn extract_public_functions(source: &str) -> Vec<(String, String, String, String
     results
 }
 
-/// Like `strip_extern_bodies` but also strips plain `pub fn` bodies, so the
-/// hot module-graph functions count as "body-only" changes too.  Private
-/// helpers (`fn state`, `fn spawn_default_quads`) and `pub(crate)` items keep
-/// their bodies, so editing them is correctly treated as a full rebuild.
-fn strip_hot_bodies(source: &str) -> String {
+/// Lexically-aware extractor for private lib.rs helpers
+/// (`fn NAME(params) [-> Ret] { body }`, no `pub`/`extern`) - these are hot
+/// too, so editing them can be per-function patched.  Returns
+/// `Vec<(name, params, body, return_type)>`.
+fn extract_private_functions(source: &str) -> Vec<(String, String, String, String)> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let marker_total = b"fn ".len();
+    let mut results = Vec::new();
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    while let Some(start) = find_private_fn_marker(bytes, &mask, i) {
+        let name_start = start + marker_total;
+        let mut name_end = name_start;
+        while name_end < n && bytes[name_end] != b'(' {
+            name_end += 1;
+        }
+        let name = source[name_start..name_end].trim().to_string();
+
+        let mut paren_depth = 0u32;
+        let mut params_end = 0usize;
+        let mut j = name_end;
+        let mut found_open = false;
+        while j < n {
+            if mask[j] {
+                if bytes[j] == b'(' {
+                    paren_depth += 1;
+                    found_open = true;
+                } else if bytes[j] == b')' {
+                    paren_depth -= 1;
+                    if found_open && paren_depth == 0 {
+                        params_end = j;
+                        break;
+                    }
+                }
+            }
+            j += 1;
+        }
+        let params = source[name_end + 1..params_end].trim().to_string();
+
+        let mut k = params_end + 1;
+        let mut body_open = 0usize;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                body_open = k;
+                break;
+            }
+            k += 1;
+        }
+        let ret_section = &source[params_end + 1..body_open];
+        let ret_type = if let Some(arrow) = ret_section.find("->") {
+            ret_section[arrow + 2..]
+                .trim()
+                .split(|c: char| c.is_whitespace() || c == '{')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        let mut depth = 1u32;
+        let mut body_end = 0usize;
+        let mut b = body_open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = b;
+                        break;
+                    }
+                }
+            }
+            b += 1;
+        }
+        let body = source[body_open + 1..body_end].trim().to_string();
+
+        results.push((name, params, body, ret_type));
+        i = body_end + 1;
+    }
+
+    results
+}
+
+/// Strips the bodies of every hot function (extern, `pub fn` and hot private
+/// helpers), so a hot-function body edit counts as a "body-only" change.  The
+/// `hot_names` set decides which private lib.rs helpers are hot; non-hot
+/// infrastructure (`fn state`, `fn spawn_default_quads`) and `pub(crate)`
+/// items keep their bodies, so editing them is correctly treated as a full
+/// rebuild.
+fn strip_hot_bodies(source: &str, hot_names: &std::collections::HashSet<String>) -> String {
+    #[derive(Clone, Copy)]
+    enum MarkerKind {
+        /// `pub extern "C" fn` / `pub fn`: bodies always stripped.
+        Always,
+        /// private lib helper `fn`: strip only if its name is hot.
+        Private,
+    }
+
     let mask = code_mask(source);
     let bytes = source.as_bytes();
     let mut result = String::new();
@@ -558,18 +694,71 @@ fn strip_hot_bodies(source: &str) -> String {
     let n = bytes.len();
 
     loop {
-        let next_extern = find_extern_marker(bytes, &mask, i);
-        let next_pub = find_pub_fn_marker(bytes, &mask, i);
-        let start = match (next_extern, next_pub) {
-            (Some(extern_start), Some(pub_start)) => Some(extern_start.min(pub_start)),
-            (Some(extern_start), None) => Some(extern_start),
-            (None, Some(pub_start)) => Some(pub_start),
-            (None, None) => None,
+        // Find the earliest hot-function marker of any kind.
+        let next_extern = find_extern_marker(bytes, &mask, i).map(|s| (s, MarkerKind::Always));
+        let next_pub = find_pub_fn_marker(bytes, &mask, i).map(|s| (s, MarkerKind::Always));
+        let next_private = find_private_fn_marker(bytes, &mask, i).map(|s| (s, MarkerKind::Private));
+
+        let (start, kind) = match (next_extern, next_pub, next_private) {
+            (Some(a), Some(b), Some(c)) => {
+                let (s, k) = if a.0 <= b.0 && a.0 <= c.0 {
+                    a
+                } else if b.0 <= c.0 {
+                    b
+                } else {
+                    c
+                };
+                (s, k)
+            }
+            (Some(a), Some(b), None) => {
+                if a.0 <= b.0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(a), None, Some(c)) => {
+                if a.0 <= c.0 {
+                    a
+                } else {
+                    c
+                }
+            }
+            (None, Some(b), Some(c)) => {
+                if b.0 <= c.0 {
+                    b
+                } else {
+                    c
+                }
+            }
+            (Some(a), None, None) => a,
+            (None, Some(b), None) => b,
+            (None, None, Some(c)) => c,
+            (None, None, None) => {
+                result.push_str(&source[i..]);
+                return result;
+            }
         };
-        let Some(start) = start else {
-            result.push_str(&source[i..]);
-            return result;
-        };
+
+        // For a private helper, decide strip (hot at root) vs keep (non-hot
+        // or name-colliding lib helper).  `hot_names` here carries only
+        // root-scope hot names, so a lib `scale_value_003` that collides with
+        // `modules::module_003::scale_value_003` is kept whole.
+        let mut should_strip = true;
+        if matches!(kind, MarkerKind::Private) {
+            let marker_len = b"fn ".len();
+            let mut name_start = start + marker_len;
+            while name_start < n && (bytes[name_start] == b' ' || bytes[name_start] == b'\t') {
+                name_start += 1;
+            }
+            let mut name_end = name_start;
+            while name_end < n && bytes[name_end] != b'(' {
+                name_end += 1;
+            }
+            let name = &source[name_start..name_end];
+            should_strip = hot_names.contains(name);
+        }
+
         result.push_str(&source[i..start]);
 
         let mut open: Option<usize> = None;
@@ -585,7 +774,6 @@ fn strip_hot_bodies(source: &str) -> String {
             result.push_str(&source[start..]);
             return result;
         };
-        result.push_str(&source[start..=open]);
 
         let mut depth = 1u32;
         let mut close: Option<usize> = None;
@@ -604,13 +792,19 @@ fn strip_hot_bodies(source: &str) -> String {
             }
             b += 1;
         }
-        match close {
-            Some(close) => i = close + 1,
-            None => {
-                result.push_str(&source[open + 1..]);
-                return result;
-            }
+        let Some(close) = close else {
+            result.push_str(&source[start..]);
+            return result;
+        };
+
+        if should_strip {
+            // Strip the body: keep the signature + opening brace.
+            result.push_str(&source[start..=open]);
+        } else {
+            // Infrastructure helper (or pub(crate) bloat): keep it whole.
+            result.push_str(&source[start..=close]);
         }
+        i = close + 1;
     }
 }
 
@@ -840,16 +1034,16 @@ fn extract_top_level_functions(source: &str) -> Vec<String> {
 
     while i < n {
         // A real `fn` declaration starts a statement (preceded by a
-        // delimiter), never the `fn` inside a type or expression.
+        // delimiter), never the `fn` inside a type or expression.  The marker
+        // `fn ` already includes the trailing space, so `bytes[i + 3]` is the
+        // first letter of the function name - no word-boundary check needed
+        // (and one would wrongly reject every real function name).
         let prev_is_delimiter = i == 0
             || matches!(
                 bytes[i - 1],
                 b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
             );
-        let is_word_start = prev_is_delimiter
-            && mask[i]
-            && bytes[i..].starts_with(b"fn ")
-            && (i + 3 >= n || !(bytes[i + 3].is_ascii_alphanumeric() || bytes[i + 3] == b'_'));
+        let is_word_start = prev_is_delimiter && mask[i] && bytes[i..].starts_with(b"fn ");
         if is_word_start {
             // Skip extern functions (`pub extern "C" fn ...`): the declaration
             // text between the previous statement boundary and `fn` contains
@@ -942,15 +1136,25 @@ struct HotSymbol {
     index: usize,
 }
 
-/// Collect every hot-reloadable function in canonical order: lib.rs
-/// (project_update, exported), modules.rs (run_update/run_compute) and each
-/// module file (tick/compute/sample/scale/offset), the latter being plain
-/// `pub fn` found through the single `project_resolve_symbol` export.
-/// project_set_api / project_init / project_resolve_symbol are load-time
-/// plumbing, not hot - they never appear here.
+/// Collect every hot-reloadable function in canonical order: the module graph
+/// (modules.rs run_update/run_compute + each module file's tick/compute/
+/// sample/scale/offset as plain `pub fn`), then lib.rs (project_update plus
+/// private helpers like `get_aaa`/`scale_value_003`).  Plumbing
+/// (project_set_api / project_init / project_resolve_symbol) and
+/// infrastructure (`state`, `spawn_default_quads`) are not hot.  Module-graph
+/// names win collisions, so a lib helper named like a module function (e.g.
+/// `scale_value_003`) is left non-hot (full rebuild on edit).
 fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> {
-    let mut symbols = Vec::new();
-    for (path, content) in project_sources {
+    // Process non-lib files first so module-graph names take precedence over
+    // colliding lib.rs helper names.
+    let mut order: Vec<&(PathBuf, String)> = project_sources.iter().collect();
+    order.sort_by_key(|(path, _)| {
+        let is_lib = path.file_name().map_or(false, |name| name == "lib.rs");
+        (is_lib, path.clone())
+    });
+
+    let mut symbols: Vec<HotSymbol> = Vec::new();
+    for (path, content) in order {
         let file_name = match path.file_name().and_then(|name| name.to_str()) {
             Some(name) => name,
             None => continue,
@@ -964,19 +1168,27 @@ fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> 
             }
             _ => continue,
         };
-        // lib.rs hot functions are exported (`pub extern "C"`); graph
-        // functions are plain `pub fn` (found through the resolver).
-        let extracted = if scope == "top" {
-            extract_function_bodies(content)
+        // lib.rs: exported hot fns + private helper fns; graph files: `pub fn`.
+        let mut extracted = if scope == "top" {
+            let mut list = extract_function_bodies(content);
+            list.extend(extract_private_functions(content));
+            list
         } else {
             extract_public_functions(content)
         };
-        for (name, params, body, ret) in extracted {
-            if name == "project_set_api"
+
+        // Plumb through the (name, params, body, ret) tuples.
+        for (name, params, body, ret) in extracted.drain(..) {
+            let is_infra = name == "project_set_api"
                 || name == "project_init"
                 || name == "project_resolve_symbol"
                 || name == "resolve_hot_symbol"
-            {
+                || name == "state"
+                || name == "spawn_default_quads";
+            // Skip infrastructure and any name that a module already owns
+            // (module-graph names take precedence because they are processed
+            // first).
+            if is_infra || symbols.iter().any(|symbol| symbol.name == name) {
                 continue;
             }
             let index = symbols.len();
@@ -1142,7 +1354,22 @@ fn build_modules_skeleton(symbols: &[HotSymbol], changed_name: &str) -> String {
 fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_name: &str) -> String {
     let consts = extract_top_level_consts(lib_source).join("\n");
     let type_definitions = extract_top_level_type_definitions(lib_source).join("\n");
-    let helper_functions = extract_top_level_functions(lib_source).join("\n");
+    // Inject non-hot lib helpers only - hot helpers (get_aaa, scale_value_003)
+    // are emitted as wrappers/real-bodies in `top_definitions` instead, so
+    // injecting them again here would be a duplicate definition.  A lib
+    // helper whose name collides with a MODULE function (e.g. a lib
+    // `scale_value_003`) is NOT hot (module names win) and must be kept.
+    let helper_functions = extract_top_level_functions(lib_source)
+        .into_iter()
+        .filter(|definition| {
+            let name = definition
+                .strip_prefix("fn ")
+                .and_then(|rest| rest.split(['(', ' ', '\n', '\t']).next())
+                .unwrap_or("");
+            !symbols.iter().any(|symbol| symbol.name == name && symbol.scope == "top")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let modules_skeleton = build_modules_skeleton(symbols, changed_name);
 
     // The top-level hot symbol (project_update): real body if it is the one
@@ -1391,7 +1618,12 @@ impl ProjectSession {
                     .map(|(_, content)| content.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.stripped_source = strip_hot_bodies(&combined_source);
+                let hot_names: std::collections::HashSet<String> = hot_symbols
+                    .iter()
+                    .filter(|symbol| symbol.scope == "top")
+                    .map(|symbol| symbol.name.clone())
+                    .collect();
+                self.stripped_source = strip_hot_bodies(&combined_source, &hot_names);
                 for entry in &extract_function_bodies(&combined_source) {
                     self.upsert_cached(entry.clone());
                 }
@@ -1629,12 +1861,23 @@ impl ProjectSession {
             .unwrap_or_default();
 
         let extern_funcs = extract_function_bodies(&combined_source);
-        let stripped = strip_hot_bodies(&combined_source);
+
+        // Canonical hot symbols (project_update + module graph + lib helpers).
+        let symbols = collect_hot_symbols(&project_sources);
+
+        // Strip hot-function bodies (private lib helpers only when hot) so a
+        // hot body edit counts as a body-only change.  Use ROOT-scope names
+        // only: a lib helper whose name collides with a module function (e.g.
+        // lib `scale_value_003` vs `modules::module_003::scale_value_003`) is
+        // NOT hot and its body must be kept so edits to it are detected.
+        let root_hot_names: std::collections::HashSet<String> = symbols
+            .iter()
+            .filter(|symbol| symbol.scope == "top")
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        let stripped = strip_hot_bodies(&combined_source, &root_hot_names);
         let stripped_changed = stripped != self.stripped_source;
         self.stripped_source = stripped;
-
-        // Canonical hot symbols (project_update + the module-graph pub fns).
-        let symbols = collect_hot_symbols(&project_sources);
 
         // Per-function diff against the cache.  Tracked = the NON-hot plumbing
         // exports (set_api/init/resolve_symbol) + all hot symbols.  Hot

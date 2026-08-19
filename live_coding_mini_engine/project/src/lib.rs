@@ -194,6 +194,14 @@ fn spawn_default_quads(game_state: &mut GameState, screen_width: f32, screen_hei
     game_state.quad_count = count;
 }
 
+fn get_aaa() -> i32 {
+    6
+}
+
+fn scale_value_0032(input: i32, factor: i32) -> i32 {
+    input * factor * get_aaa() * 6
+}
+
 /// The engine calls this every frame.  Animate the engine-owned quads so they
 /// jump around the window - tweak anything here while the game runs and save
 /// to live-reload.
@@ -203,6 +211,8 @@ pub extern "C" fn project_update(delta_time: f32) {
     game_state.tick += delta_time;
 
     let screen_width = unsafe { ((*API).screen_width)() };
+
+    scale_value_0032(game_state.tick as i32, 8);
 
     // Fan out into the interconnected module graph and fold the results into
     // a small "tuning noise" that perturbs the jump.  This makes the whole
@@ -228,7 +238,7 @@ pub extern "C" fn project_update(delta_time: f32) {
         // slightly by the module-graph noise so the interconnected code has a
         // visible (but subtle) effect on the animation.
         quad.jump_phase += quad.jump_speed * delta_time;
-        let noise_scale = 1.0 + ((tuning_noise % 41) as f32) / 1000.0;
+        let noise_scale = 1.0 + ((tuning_noise % 47) as f32) / 1000.0;
         quad.y = quad.base_y - quad.jump_phase.sin().abs() * quad.jump_height * noise_scale;
     }
 }

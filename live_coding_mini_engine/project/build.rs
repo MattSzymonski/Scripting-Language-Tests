@@ -39,6 +39,14 @@ fn main() {
         }
     }
     files.sort();
+    // Process non-lib files FIRST so module-graph names take precedence over
+    // colliding lib.rs helper names (hot functions are resolved by name, so
+    // names must be unique - e.g. a lib helper named `scale_value_003` would
+    // clash with `modules::module_003::scale_value_003`).
+    files.sort_by_key(|path| {
+        let is_lib = path.file_name().map_or(false, |name| name == "lib.rs");
+        (is_lib, path.clone())
+    });
 
     // (name, Rust path expression) for every hot function.
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -63,18 +71,51 @@ fn main() {
         let mask = code_mask(&content);
         let bytes = content.as_bytes();
         let n = bytes.len();
-        let marker_len = if is_lib_rs {
-            b"pub extern ".len() + b"\"C\" fn ".len()
-        } else {
-            b"pub fn ".len()
-        };
 
-        let mut i = 0usize;
-        while let Some(start) = if is_lib_rs {
-            find_extern_marker(bytes, &mask, i)
+        // Collect every applicable function marker (start, marker_len).
+        let mut markers: Vec<(usize, usize)> = Vec::new();
+        if !is_lib_rs {
+            // Module files: plain `pub fn` graph functions.
+            let mut i = 0usize;
+            while let Some(start) = find_pub_fn_marker(bytes, &mask, i) {
+                markers.push((start, b"pub fn ".len()));
+                let Some(open) = find_open_brace(bytes, &mask, start) else {
+                    break;
+                };
+                let Some(close) = find_matching_close(bytes, &mask, open) else {
+                    break;
+                };
+                i = close + 1;
+            }
         } else {
-            find_pub_fn_marker(bytes, &mask, i)
-        } {
+            // lib.rs: exported hot fns (project_update) ...
+            let mut i = 0usize;
+            while let Some(start) = find_extern_marker(bytes, &mask, i) {
+                markers.push((start, b"pub extern ".len() + b"\"C\" fn ".len()));
+                let Some(open) = find_open_brace(bytes, &mask, start) else {
+                    break;
+                };
+                let Some(close) = find_matching_close(bytes, &mask, open) else {
+                    break;
+                };
+                i = close + 1;
+            }
+            // ... and private helper fns (get_aaa, scale_value_003, ...).
+            let mut i = 0usize;
+            while let Some(start) = find_private_fn_marker(bytes, &mask, i) {
+                markers.push((start, b"fn ".len()));
+                let Some(open) = find_open_brace(bytes, &mask, start) else {
+                    break;
+                };
+                let Some(close) = find_matching_close(bytes, &mask, open) else {
+                    break;
+                };
+                i = close + 1;
+            }
+        }
+        markers.sort();
+
+        for (start, marker_len) in markers {
             // Function name (up to the '(').
             let mut name_start = start + marker_len;
             while name_start < n && (bytes[name_start] == b' ' || bytes[name_start] == b'\t') {
@@ -86,12 +127,16 @@ fn main() {
             }
             let name = content[name_start..name_end].trim().to_string();
 
-            // Skip load-time plumbing + the registry itself.
-            if name != "project_set_api"
-                && name != "project_init"
-                && name != "project_resolve_symbol"
-                && name != "resolve_hot_symbol"
-            {
+            // Skip load-time plumbing, infrastructure helpers, the registry,
+            // and any name that collides with an already-registered hot
+            // symbol (module-graph names win because they are first).
+            let is_infra = name == "project_set_api"
+                || name == "project_init"
+                || name == "project_resolve_symbol"
+                || name == "resolve_hot_symbol"
+                || name == "state"
+                || name == "spawn_default_quads";
+            if !is_infra && !entries.iter().any(|(registered, _)| *registered == name) {
                 let path = if is_lib_rs {
                     name.clone()
                 } else {
@@ -99,15 +144,6 @@ fn main() {
                 };
                 entries.push((name, path));
             }
-
-            // Move past this function's body so nested markers never match.
-            let Some(open) = find_open_brace(bytes, &mask, name_end) else {
-                break;
-            };
-            let Some(close) = find_matching_close(bytes, &mask, open) else {
-                break;
-            };
-            i = close + 1;
         }
     }
 
@@ -328,6 +364,44 @@ fn find_pub_fn_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize>
             && mask[i..i + marker.len()].iter().all(|&is_code| is_code)
         {
             return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a private `fn ` declaration (no `pub` / `extern` prefix, e.g.
+/// `fn get_aaa`), mask-aware.  Used to register lib.rs helper functions.
+fn find_private_fn_marker(bytes: &[u8], mask: &[bool], from: usize) -> Option<usize> {
+    let marker = b"fn ";
+    let n = bytes.len();
+    let mut i = from;
+    while i + marker.len() <= n {
+        if &bytes[i..i + marker.len()] == marker
+            && mask[i..i + marker.len()].iter().all(|&is_code| is_code)
+        {
+            let prev_ok = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
+                );
+            if prev_ok {
+                // The declaration before `fn` must not contain `pub`/`extern`
+                // (that would be `pub fn`, `pub(crate) fn` or `extern "C" fn`).
+                let mut decl_start = i;
+                while decl_start > 0
+                    && !matches!(bytes[decl_start - 1], b'\n' | b'\r' | b';' | b'{' | b'}')
+                {
+                    decl_start -= 1;
+                }
+                let declaration = String::from_utf8_lossy(&bytes[decl_start..i]);
+                let words: Vec<&str> = declaration.split_whitespace().collect();
+                let has_pub = words.iter().any(|word| word.contains("pub"));
+                let has_extern = words.iter().any(|word| word.contains("extern"));
+                if !has_pub && !has_extern {
+                    return Some(i);
+                }
+            }
         }
         i += 1;
     }
