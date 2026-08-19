@@ -245,7 +245,9 @@ fn print_verification_checksum() {
     }
 }
 
-fn get_aaa() -> i32 { 56 }
+fn get_aaa() -> i32 {
+    56
+}
 
 fn scale_value_0032(input: i32, factor: i32) -> i32 {
     input * factor * get_aaa() * 8
