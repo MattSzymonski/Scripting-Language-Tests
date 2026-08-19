@@ -7,16 +7,20 @@
 // DESCRIPTION
 //   Live Coding host — a Live++ / UE-style hot reload loop.  The base DLL
 //   (patch_dll.dll) is loaded ONCE and its exported `update`/`compute` are
-//   called with PLAIN direct function pointers — no wrapper, no jump table.
-//   When you edit a function and save:
+//   called through typed HotFn wrappers — no jump table.  When you edit code
+//   and save:
 //
 //     - Leaf functions (compute) are recompiled to a tiny DLL, then their
 //       PROLOGUE in the loaded base DLL is patched with a `jmp rel32` to the
 //       new code.  Existing callers are redirected in place (Live Coding!).
-//     - Functions with internal dependencies (update) trigger a full cargo
-//       rebuild + reload, then leaf prologues are re-applied.
+//     - Anything else (update, structs, helpers, test.rs, new modules, a
+//       leaf that references internals) triggers a full cargo build with a
+//       LOAD-ALONGSIDE reload: the fresh DLL is loaded while the old one
+//       stays running, pointers are swapped, then the old DLL is freed — no
+//       unload gap.
 //     - A brand-new function can be compiled, loaded, and REGISTERED by name
 //       at runtime (the "add a new function live" capability).
+//     - Host-owned state (via HostServices) survives every patch and reload.
 //
 // USAGE
 //   cargo run -p live_patch -- loop        # hot-reload loop
@@ -123,8 +127,9 @@ fn demo_new_function() {
             );
             // Resolve by name and call it — this function did not exist at startup.
             if let Some(resolved) = live_coding::resolve_symbol("extra_new") {
-                let extra_fn: ExtraFn = unsafe { std::mem::transmute(resolved) };
-                let value = unsafe { extra_fn(3) };
+                let extra_fn: live_coding::HotFn<ExtraFn> =
+                    unsafe { live_coding::HotFn::from_address(resolved) };
+                let value = unsafe { extra_fn.call(3) };
                 println!("  Called registered 'extra_new'(3) = {value}  (expected 307)");
             } else {
                 println!("  Could not resolve 'extra_new' by name");
@@ -161,17 +166,73 @@ fn build_patch_dll(workspace_root: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Reload the base DLL from `base_dll` and return (handle, update_addr,
-/// compute_addr).  Used both after a successful rebuild and to recover the
-/// previous DLL when a rebuild fails (the old file is never overwritten by a
-/// failed build, so it is still valid on disk).
-unsafe fn load_base_dll(
-    base_dll: &std::path::Path,
-) -> Result<(*mut std::ffi::c_void, u64, u64), String> {
-    let handle = unsafe { live_coding::load_library(base_dll) }?;
-    let update_address = unsafe { live_coding::resolve_export(handle, "update") }?;
-    let compute_address = unsafe { live_coding::resolve_export(handle, "compute") }?;
-    Ok((handle, update_address, compute_address))
+/// A loaded base DLL and everything needed to use and later release it.
+struct BaseDll {
+    handle: *mut std::ffi::c_void,
+    temp_path: PathBuf,
+    update_address: u64,
+    compute_address: u64,
+}
+
+/// Unique temp path for a base-DLL copy (PID + counter avoids collisions).
+fn unique_temp_path(kind: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{kind}_{}_{counter}.dll", std::process::id()))
+}
+
+/// Load a freshly built base DLL the LOAD-ALONGSIDE way: copy it to a unique
+/// temp path, load the copy, hand it the host services, and resolve
+/// `update`/`compute`.  Loading the copy means the original file is never
+/// locked, so cargo can overwrite it on the next build.
+unsafe fn load_base_dll_copy(base_dll: &std::path::Path) -> Result<BaseDll, String> {
+    let temp_path = unique_temp_path("live_base");
+    std::fs::copy(base_dll, &temp_path).map_err(|e| {
+        format!(
+            "cannot copy {} to {}: {e}",
+            base_dll.display(),
+            temp_path.display()
+        )
+    })?;
+
+    let handle = match unsafe { live_coding::load_library(&temp_path) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
+    // Hand the DLL the host services so its code can reach host-owned state.
+    if let Err(e) = unsafe { live_coding::provide_services_to_dll(handle) } {
+        unsafe { live_coding::unload_library(handle) };
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    let update_address = match unsafe { live_coding::resolve_export(handle, "update") } {
+        Ok(address) => address,
+        Err(e) => {
+            unsafe { live_coding::unload_library(handle) };
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+    let compute_address = match unsafe { live_coding::resolve_export(handle, "compute") } {
+        Ok(address) => address,
+        Err(e) => {
+            unsafe { live_coding::unload_library(handle) };
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
+    Ok(BaseDll {
+        handle,
+        temp_path,
+        update_address,
+        compute_address,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -203,49 +264,39 @@ fn run_hot_reload_loop() {
         .join("debug")
         .join("patch_dll.dll");
 
-    // Load the base DLL and resolve the exported entry points to PLAIN
-    // function pointers.  There is no wrapper and no jump table: after a
-    // prologue patch these same pointers transparently call the new code.
-    // `base_handle` is kept mutable so a full reload can re-capture the
-    // freshly loaded DLL's handle for the next unload.
-    print!("  Loading base DLL... ");
-    let mut base_handle = match unsafe { live_coding::load_library(&base_dll) } {
-        Ok(handle) => handle,
+    // Load the base DLL (as a temp copy — the original file stays unlocked)
+    // and resolve the exported entry points into typed HotFn wrappers.  No
+    // wrapper, no jump table: after a prologue patch these same pointers
+    // transparently call the new code.
+    print!("  Loading base DLL (temp copy)... ");
+    let mut base_dll_state = match unsafe { load_base_dll_copy(&base_dll) } {
+        Ok(state) => state,
         Err(e) => {
             println!("failed: {e}");
             return;
         }
     };
-    let update_address = match unsafe { live_coding::resolve_export(base_handle, "update") } {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("failed to resolve 'update': {e}");
-            return;
-        }
-    };
-    let compute_address = match unsafe { live_coding::resolve_export(base_handle, "compute") } {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("failed to resolve 'compute': {e}");
-            return;
-        }
-    };
-    println!("OK (update @ {update_address:#x}, compute @ {compute_address:#x})");
+    println!(
+        "OK (update @ {:#x}, compute @ {:#x})",
+        base_dll_state.update_address, base_dll_state.compute_address
+    );
 
-    // Direct callable pointers — the ONLY way we call the game functions.
-    // `compute_address` is kept mutable because a full rebuild reloads the
-    // base DLL and re-resolves the prologue-patch target; `update_address` is
-    // only used once to build the callable pointer.
-    let mut compute_address = compute_address;
-    let mut update_fn: UpdateFn = unsafe { std::mem::transmute(update_address) };
-    let mut compute_fn: ComputeFn = unsafe { std::mem::transmute(compute_address) };
+    // Typed callable wrappers — the ONLY way we call the game functions.
+    // `compute_address` is kept mutable because it is the prologue-patch
+    // target and changes on every full reload.
+    let mut compute_address = base_dll_state.compute_address;
+    let mut update_fn: live_coding::HotFn<UpdateFn> =
+        unsafe { live_coding::HotFn::from_address(base_dll_state.update_address) };
+    let mut compute_fn: live_coding::HotFn<ComputeFn> =
+        unsafe { live_coding::HotFn::from_address(base_dll_state.compute_address) };
 
-    // 2. Watch state — snapshot EVERY .rs file under patch_dll/src/ so any
-    //    change (structs, helpers, test.rs, new modules, ...) is detected,
-    //    not just edits to extern function bodies in lib.rs.
+    // 2. Watch state — snapshot every .rs under patch_dll/src/ plus
+    //    Cargo.toml and build.rs, so ANY change (structs, helpers, test.rs,
+    //    new modules, dependencies, ...) is detected.
     let patch_src_root = workspace_root.join("patch_dll").join("src");
+    let patch_dll_root = workspace_root.join("patch_dll");
     let mut source_snapshots: HashMap<PathBuf, Vec<u8>> = HashMap::new();
-    for source_file in collect_source_files(&patch_src_root) {
+    for source_file in collect_watch_files(&patch_src_root, &patch_dll_root) {
         let content = std::fs::read(&source_file).unwrap_or_default();
         source_snapshots.insert(source_file, content);
     }
@@ -269,7 +320,7 @@ fn run_hot_reload_loop() {
     println!("  |   Structs / helpers /      -> full cargo build + reload      |");
     println!("  |   test.rs / new modules                                       |");
     println!("  |                                                              |");
-    println!("  |   Base DLL stays loaded.  Direct calls are redirected.       |");
+    println!("  |   Base DLL stays loaded.  Reloads are load-alongside.        |");
     println!("  |   Press Ctrl+C to exit.                                      |");
     println!("  +--------------------------------------------------------------+");
     println!();
@@ -280,7 +331,7 @@ fn run_hot_reload_loop() {
         std::thread::sleep(std::time::Duration::from_millis(800));
 
         // Diff the on-disk source against the last snapshot — ANY file change.
-        let source_files = collect_source_files(&patch_src_root);
+        let source_files = collect_watch_files(&patch_src_root, &patch_dll_root);
         let mut changed_files: Vec<PathBuf> = Vec::new();
         for source_file in &source_files {
             let current = std::fs::read(source_file).unwrap_or_default();
@@ -434,105 +485,83 @@ fn run_hot_reload_loop() {
         // A full DLL reload is needed for non-extern changes or when a
         // dependent function (update) changed.
         if full_rebuild {
-            println!("    full cargo build + reload...");
-
-            // Unload the BASE DLL (by its captured handle) BEFORE running
-            // cargo, so the linker can overwrite the file.  Note: we must
-            // use the base handle explicitly — the runtime's global handle
-            // may have been overwritten by intermediate patch-DLL loads.
-            unsafe { live_coding::unload_library(base_handle) };
+            println!("    full cargo build + load-alongside...");
 
             let build_start = Instant::now();
-            let build_result = build_patch_dll(&workspace_root);
-
-            match build_result {
+            match build_patch_dll(&workspace_root) {
                 Ok(()) => {
-                    // Load the fresh DLL and re-resolve.
-                    let new_handle = match unsafe { live_coding::load_library(&base_dll) } {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            println!("    ? reload failed: {e}");
-                            continue;
+                    // Load the fresh DLL ALONGSIDE the old one (no unload gap):
+                    // copy to a unique temp path so cargo can overwrite the
+                    // original file next time, load the copy, swap the host's
+                    // pointers, then free the old DLL.
+                    match unsafe { load_base_dll_copy(&base_dll) } {
+                        Ok(new_state) => {
+                            // Swap the callables and the prologue-patch target
+                            // to the freshly built DLL.
+                            compute_address = new_state.compute_address;
+                            update_fn = unsafe {
+                                live_coding::HotFn::from_address(new_state.update_address)
+                            };
+                            compute_fn = unsafe {
+                                live_coding::HotFn::from_address(new_state.compute_address)
+                            };
+
+                            // Nothing references the old DLL any more — free it
+                            // and clean up its temp file.
+                            unsafe { live_coding::unload_library(base_dll_state.handle) };
+                            let _ = std::fs::remove_file(&base_dll_state.temp_path);
+                            base_dll_state = new_state;
+
+                            println!(
+                                "    Loaded fresh DLL, swapped pointers, freed old in {:?}",
+                                build_start.elapsed()
+                            );
+                            patched += 1;
+
+                            // The rebuilt DLL now matches the current source for
+                            // EVERY extracted function — commit them all to the
+                            // cache so a re-save of the same bodies is treated
+                            // as unchanged.
+                            for entry in &funcs {
+                                upsert_cached_func(&mut cached_funcs, entry.clone());
+                            }
                         }
-                    };
-                    // Remember the new base handle for the next unload.
-                    base_handle = new_handle;
-                    let new_update =
-                        match unsafe { live_coding::resolve_export(new_handle, "update") } {
-                            Ok(addr) => addr,
-                            Err(e) => {
-                                println!("    ? resolve update failed: {e}");
-                                continue;
-                            }
-                        };
-                    let new_compute =
-                        match unsafe { live_coding::resolve_export(new_handle, "compute") } {
-                            Ok(addr) => addr,
-                            Err(e) => {
-                                println!("    ? resolve compute failed: {e}");
-                                continue;
-                            }
-                        };
-
-                    // Point the direct callables and the prologue-patch target
-                    // at the freshly rebuilt DLL.
-                    compute_address = new_compute;
-                    update_fn = unsafe { std::mem::transmute(new_update) };
-                    compute_fn = unsafe { std::mem::transmute(new_compute) };
-                    println!(
-                        "    Reloaded base DLL + re-resolved in {:?}",
-                        build_start.elapsed()
-                    );
-                    patched += 1;
-
-                    // The rebuilt DLL now matches the current source for
-                    // EVERY extracted function — commit them all to the
-                    // cache so a re-save of the same bodies is treated as
-                    // unchanged.
-                    for entry in &funcs {
-                        upsert_cached_func(&mut cached_funcs, entry.clone());
+                        Err(e) => {
+                            // The old DLL was never unloaded — keep running it.
+                            println!("    ? load-alongside failed: {e}");
+                            println!("    Kept previous DLL running (nothing was unloaded).");
+                        }
                     }
                 }
                 Err(errors) => {
-                    // The build failed — PRINT the compiler diagnostics, then
-                    // recover by reloading the PREVIOUS DLL (still intact on
-                    // disk, since a failed build never overwrites it) so the
-                    // game keeps running the last good code.
+                    // The build failed and the old DLL was never unloaded —
+                    // the game keeps running the last good code untouched.
                     println!("    ? cargo build FAILED.  Compiler output:\n{errors}");
-                    println!("    Reloading the previous DLL to keep running...");
-                    match unsafe { load_base_dll(&base_dll) } {
-                        Ok((old_handle, old_update, old_compute)) => {
-                            base_handle = old_handle;
-                            compute_address = old_compute;
-                            update_fn = unsafe { std::mem::transmute(old_update) };
-                            compute_fn = unsafe { std::mem::transmute(old_compute) };
-                            println!("    Recovered previous DLL (still running old code).");
-                        }
-                        Err(e) => {
-                            println!("    ? recovery failed: {e}");
-                            continue;
-                        }
-                    }
+                    println!("    Kept previous DLL running (nothing was unloaded).");
                 }
             }
         }
 
         println!(
-                "  -- {patched} patched, {skipped} unchanged, {absorbed_by_rebuild} handled by rebuild -- total {:?} --\n",
-                total_start.elapsed()
-            );
+            "  -- {patched} patched, {skipped} unchanged, {absorbed_by_rebuild} handled by rebuild -- total {:?} --\n",
+            total_start.elapsed()
+        );
     }
 }
 
 /// One iteration of game logic — calls update and compute through PLAIN
 /// function pointers.  No wrapper: if a prologue was patched, the same
 /// pointers transparently execute the new code.
-fn game_tick(iteration: u64, update_fn: UpdateFn, compute_fn: ComputeFn) {
+fn game_tick(
+    iteration: u64,
+    update_fn: live_coding::HotFn<UpdateFn>,
+    compute_fn: live_coding::HotFn<ComputeFn>,
+) {
     let tick_val = iteration as i32;
 
-    unsafe { update_fn(tick_val) };
+    unsafe { update_fn.call(tick_val) };
 
-    let result = unsafe { compute_fn(tick_val, 3) };
+    let result = unsafe { compute_fn.call(tick_val, 3) };
     println!("    compute({tick_val}, 3) = {result}");
 }
 
@@ -560,49 +589,85 @@ fn collect_source_files(root: &std::path::Path) -> Vec<PathBuf> {
     files
 }
 
+/// All files whose changes can affect the build: every `.rs` under
+/// `patch_src_root` plus `Cargo.toml` and `build.rs` in `patch_dll_root`.
+fn collect_watch_files(
+    patch_src_root: &std::path::Path,
+    patch_dll_root: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut files = collect_source_files(patch_src_root);
+    for extra in [
+        patch_dll_root.join("Cargo.toml"),
+        patch_dll_root.join("build.rs"),
+    ] {
+        if extra.exists() {
+            files.push(extra);
+        }
+    }
+    files.sort();
+    files
+}
+
 /// Return `source` with the BODY of every `pub extern "C" fn` removed (the
 /// signatures are kept).  Diffing two versions of this stripped text tells us
 /// whether only function bodies changed (fast prologue-patch) or whether
 /// non-body content — structs, internal helpers, attributes, `mod` decls —
 /// also changed (which requires a full rebuild).
 fn strip_extern_bodies(source: &str) -> String {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
     let mut result = String::new();
-    let mut rest = source;
+    let mut i = 0usize;
+    let n = bytes.len();
 
-    while let Some(start) = rest.find("pub extern \"C\" fn ") {
+    while let Some(start) = find_extern_marker(bytes, &mask, i) {
         // Keep everything before the function.
-        result.push_str(&rest[..start]);
-        rest = &rest[start..];
+        result.push_str(&source[i..start]);
 
-        // Find the opening brace of the body and keep the signature up to it.
-        let Some(open) = rest.find('{') else {
+        // Find the body opening brace (code only — skips strings/comments).
+        let mut k = start;
+        let mut open: Option<usize> = None;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                open = Some(k);
+                break;
+            }
+            k += 1;
+        }
+        let Some(open) = open else {
             // No body found — keep the remainder as-is.
-            result.push_str(rest);
-            break;
+            result.push_str(&source[start..]);
+            return result;
         };
-        result.push_str(&rest[..=open]);
-        rest = &rest[open + 1..];
 
-        // Drop the body up to the matching closing brace.
+        // Keep the signature through the opening brace.
+        result.push_str(&source[start..=open]);
+
+        // Drop the body up to the matching closing brace (code only).
         let mut depth = 1u32;
-        let mut body_end = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
+        let mut close: Option<usize> = None;
+        let mut b = open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
                     depth -= 1;
                     if depth == 0 {
-                        body_end = i;
+                        close = Some(b);
                         break;
                     }
                 }
-                _ => {}
             }
+            b += 1;
         }
-        rest = &rest[body_end + 1..];
+        match close {
+            Some(close) => i = close + 1,
+            None => return result, // unterminated; keep what we have
+        }
     }
 
-    result.push_str(rest);
+    result.push_str(&source[i..]);
     result
 }
 
@@ -622,39 +687,250 @@ fn upsert_cached_func(
     }
 }
 
-/// Crude parser: extract `pub extern "C" fn NAME(params) [-> RetType] { body }`
-/// Returns `Vec<(function_name, params, body_text, return_type)>`.
+/// Lexical mask: `true` where `source` is real code, `false` inside string
+/// literals, char literals, or comments (con 6: mini-lexer).  Brace counting
+/// and marker searches only look at code positions, so braces inside strings
+/// or comments can never confuse the extractor.
+fn code_mask(source: &str) -> Vec<bool> {
+    enum State {
+        Code,
+        LineComment,
+        BlockComment(u32),
+        StringLit,
+        CharLit,
+    }
+
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut mask = vec![true; n];
+    let mut state = State::Code;
+    let mut i = 0usize;
+
+    while i < n {
+        let b = bytes[i];
+        match state {
+            State::Code => {
+                // Line comment `//`.
+                if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+                    mask[i] = false;
+                    mask[i + 1] = false;
+                    state = State::LineComment;
+                    i += 2;
+                    continue;
+                }
+                // Block comment `/* ... */` (nesting-aware).
+                if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                    mask[i] = false;
+                    mask[i + 1] = false;
+                    state = State::BlockComment(1);
+                    i += 2;
+                    continue;
+                }
+                // String literal `"..."` (handles backslash escapes).
+                if b == b'"' {
+                    mask[i] = false;
+                    state = State::StringLit;
+                    i += 1;
+                    continue;
+                }
+                // Raw / byte string: r"...", r#"..."#, b"...", br#"..."#.
+                if (b == b'r' || b == b'b') && i + 1 < n {
+                    let mut j = i + 1;
+                    let mut hashes = 0usize;
+                    while j < n && bytes[j] == b'#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if j < n && bytes[j] == b'"' {
+                        // Mask the prefix (r / b, #'s, opening quote).
+                        for k in i..=j {
+                            mask[k] = false;
+                        }
+                        // Find closing `"` followed by `hashes` #'s.
+                        let mut k = j + 1;
+                        let mut closed = false;
+                        while k < n {
+                            if bytes[k] == b'"' {
+                                let mut h = 0usize;
+                                let mut m = k + 1;
+                                while m < n && h < hashes && bytes[m] == b'#' {
+                                    h += 1;
+                                    m += 1;
+                                }
+                                if h == hashes {
+                                    for z in k..m {
+                                        mask[z] = false;
+                                    }
+                                    i = m;
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            mask[k] = false;
+                            k += 1;
+                        }
+                        if closed {
+                            continue;
+                        }
+                    }
+                }
+                // Char literal `'x'` / `'\n'` (not a lifetime `'a`).
+                if b == b'\'' {
+                    let mut j = i + 1;
+                    let mut is_char_literal = false;
+                    while j < n && bytes[j] != b'\n' && bytes[j] != b' ' && bytes[j] != b'\t' {
+                        if bytes[j] == b'\\' {
+                            j += 1;
+                            if j < n {
+                                j += 1;
+                            }
+                            continue;
+                        }
+                        if bytes[j] == b'\'' {
+                            is_char_literal = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if is_char_literal {
+                        mask[i] = false;
+                        state = State::CharLit;
+                        i += 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            State::LineComment => {
+                mask[i] = false;
+                if b == b'\n' {
+                    state = State::Code;
+                }
+                i += 1;
+            }
+            State::BlockComment(depth) => {
+                mask[i] = false;
+                if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                    mask[i + 1] = false;
+                    state = State::BlockComment(depth + 1);
+                    i += 2;
+                    continue;
+                }
+                if b == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                    mask[i + 1] = false;
+                    state = if depth == 1 {
+                        State::Code
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            State::StringLit => {
+                mask[i] = false;
+                if b == b'\\' && i + 1 < n {
+                    mask[i + 1] = false;
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    state = State::Code;
+                }
+                i += 1;
+            }
+            State::CharLit => {
+                mask[i] = false;
+                if b == b'\\' && i + 1 < n {
+                    mask[i + 1] = false;
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    state = State::Code;
+                }
+                i += 1;
+            }
+        }
+    }
+    mask
+}
+
+/// Find `pub extern "C" fn ` at or after `from`, where the leading `pub extern `
+/// is real code (the quoted `"C"` part is lexed as a string literal, so it is
+/// matched verbatim rather than via the code mask).
+fn find_extern_marker(haystack: &[u8], mask: &[bool], from: usize) -> Option<usize> {
+    let code_part = b"pub extern ";
+    let quoted_part = b"\"C\" fn ";
+    let total = code_part.len() + quoted_part.len();
+    let n = haystack.len();
+    let mut i = from;
+    while i + total <= n {
+        if &haystack[i..i + code_part.len()] == code_part
+            && mask[i..i + code_part.len()].iter().all(|&is_code| is_code)
+            && &haystack[i + code_part.len()..i + total] == quoted_part
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Lexically-aware extractor: `pub extern "C" fn NAME(params) [-> Ret] { body }`.
+/// Returns `Vec<(function_name, params, body_text, return_type)>`.  Braces and
+/// markers inside strings/comments are ignored via [`code_mask`].
 fn extract_function_bodies(source: &str) -> Vec<(String, String, String, String)> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let marker_total = b"pub extern ".len() + b"\"C\" fn ".len();
     let mut results = Vec::new();
-    let mut rest = source;
+    let mut i = 0usize;
+    let n = bytes.len();
 
-    while let Some(start) = rest.find("pub extern \"C\" fn ") {
-        rest = &rest[start + 18..];
+    while let Some(start) = find_extern_marker(bytes, &mask, i) {
+        // Name: up to the first `(`.
+        let name_start = start + marker_total;
+        let mut name_end = name_start;
+        while name_end < n && bytes[name_end] != b'(' {
+            name_end += 1;
+        }
+        let name = source[name_start..name_end].trim().to_string();
 
-        let name_end = rest.find('(').unwrap_or(rest.len());
-        let name = rest[..name_end].trim().to_string();
-        rest = &rest[name_end + 1..];
-
-        let mut paren_depth = 1u32;
+        // Params: balanced parens (code only).
+        let mut paren_depth = 0u32;
         let mut params_end = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch {
-                '(' => paren_depth += 1,
-                ')' => {
+        let mut j = name_end;
+        let mut found_open = false;
+        while j < n {
+            if mask[j] {
+                if bytes[j] == b'(' {
+                    paren_depth += 1;
+                    found_open = true;
+                } else if bytes[j] == b')' {
                     paren_depth -= 1;
-                    if paren_depth == 0 {
-                        params_end = i;
+                    if found_open && paren_depth == 0 {
+                        params_end = j;
                         break;
                     }
                 }
-                _ => {}
             }
+            j += 1;
         }
-        let params = rest[..params_end].trim().to_string();
-        rest = &rest[params_end + 1..];
+        let params = source[name_end + 1..params_end].trim().to_string();
 
-        let body_start = rest.find('{').unwrap_or(rest.len());
-        let ret_section = &rest[..body_start];
+        // Return type: text between `)` and the body `{`.
+        let mut k = params_end + 1;
+        let mut body_open = 0usize;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                body_open = k;
+                break;
+            }
+            k += 1;
+        }
+        let ret_section = &source[params_end + 1..body_open];
         let ret_type = if let Some(arrow) = ret_section.find("->") {
             ret_section[arrow + 2..]
                 .trim()
@@ -666,26 +942,28 @@ fn extract_function_bodies(source: &str) -> Vec<(String, String, String, String)
             String::new()
         };
 
-        rest = &rest[body_start + 1..];
+        // Body: balanced braces (code only).
         let mut depth = 1u32;
         let mut body_end = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
+        let mut b = body_open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
                     depth -= 1;
                     if depth == 0 {
-                        body_end = i;
+                        body_end = b;
                         break;
                     }
                 }
-                _ => {}
             }
+            b += 1;
         }
-        let body = rest[..body_end].trim().to_string();
-        rest = &rest[body_end + 1..];
+        let body = source[body_open + 1..body_end].trim().to_string();
 
         results.push((name, params, body, ret_type));
+        i = body_end + 1;
     }
 
     results

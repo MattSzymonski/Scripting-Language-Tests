@@ -37,21 +37,198 @@ use std::sync::{LazyLock, Mutex};
 // Global state — name-keyed symbol registry
 // ---------------------------------------------------------------------------
 
-/// Name → address registry.  New functions compiled at runtime are registered
-/// here and can be resolved by name, mirroring UE's runtime class registry.
-static SYMBOL_REGISTRY: LazyLock<Mutex<HashMap<String, u64>>> =
+/// Name → (address, ABI signature) registry.  New functions compiled at
+/// runtime are registered here and can be resolved by name, mirroring UE's
+/// runtime class registry.  The signature is stored so ABI mismatches can be
+/// caught at patch time (con 9).
+static SYMBOL_REGISTRY: LazyLock<Mutex<HashMap<String, (u64, String)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Register a symbol (name → address) so it can be resolved by name later.
-pub fn register_symbol(symbol_name: &str, address: u64) {
+/// Loaded patch-DLL (handle-as-usize, temp path) per function name.  Lets us
+/// free the previous patch DLL when a function is re-patched (con 8: resource
+/// growth).  Handles are stored as `usize` so the map is `Send`-safe.
+static PATCH_DLL_INFO: LazyLock<Mutex<HashMap<String, (usize, std::path::PathBuf)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Trampoline cache keyed by jump target, so repeated far patches to the same
+/// function reuse one trampoline instead of leaking a new one (con 8).
+static TRAMPOLINE_CACHE: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register a function with its runtime address and ABI signature.
+pub fn register_function(symbol_name: &str, address: u64, signature: &str) {
     let mut registry = SYMBOL_REGISTRY.lock().unwrap();
-    registry.insert(symbol_name.to_string(), address);
+    registry.insert(symbol_name.to_string(), (address, signature.to_string()));
+}
+
+/// Verify that `signature` matches the previously registered signature for
+/// `symbol_name`.  Returns an error on mismatch so ABI mistakes are caught at
+/// patch time instead of crashing the next call (con 2 / 9).
+pub fn verify_signature(symbol_name: &str, signature: &str) -> Result<(), String> {
+    let registry = SYMBOL_REGISTRY.lock().unwrap();
+    if let Some((_, registered)) = registry.get(symbol_name) {
+        if registered != signature {
+            return Err(format!(
+                "ABI mismatch for '{symbol_name}': registered '{registered}', new '{signature}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Register a symbol (name → address) without a signature (compat shim).
+pub fn register_symbol(symbol_name: &str, address: u64) {
+    register_function(symbol_name, address, "");
 }
 
 /// Resolve a previously registered symbol by name.  Returns `None` if the
 /// name was never registered.
 pub fn resolve_symbol(symbol_name: &str) -> Option<u64> {
-    SYMBOL_REGISTRY.lock().unwrap().get(symbol_name).copied()
+    SYMBOL_REGISTRY
+        .lock()
+        .unwrap()
+        .get(symbol_name)
+        .map(|(address, _)| *address)
+}
+
+/// Resolve a symbol together with its registered ABI signature.
+pub fn resolve_function(symbol_name: &str) -> Option<(u64, String)> {
+    SYMBOL_REGISTRY.lock().unwrap().get(symbol_name).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Typed function-pointer wrapper — contains the unsafe transmute in one place
+// ---------------------------------------------------------------------------
+
+/// A typed wrapper around a raw function address.  The signature is encoded
+/// in the type parameter, so the host can't accidentally call a hot function
+/// with the wrong ABI.  All `transmute`s happen here, in one audited spot
+/// (con 9).
+#[derive(Clone, Copy)]
+pub struct HotFn<Signature> {
+    address: u64,
+    marker: std::marker::PhantomData<Signature>,
+}
+
+impl<Signature> HotFn<Signature> {
+    /// Wrap a raw function address.
+    ///
+    /// # Safety
+    ///
+    /// `address` must point to a function whose ABI matches `Signature`, and
+    /// the module it lives in must remain loaded while this value is used.
+    pub unsafe fn from_address(address: u64) -> Self {
+        Self {
+            address,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    /// The raw address this wrapper points at.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+}
+
+// NOTE: multi-parameter fn types do not unify with `fn(Args)` where `Args` is
+// a tuple in impl heads, so we provide concrete `call` impls for the exact
+// signatures the host uses.
+
+impl HotFn<unsafe extern "C" fn(i32)> {
+    /// Call a `fn(i32)` with one argument.
+    ///
+    /// # Safety
+    ///
+    /// Same invariants as [`HotFn::from_address`].
+    pub unsafe fn call(&self, tick: i32) {
+        let function: unsafe extern "C" fn(i32) =
+            unsafe { std::mem::transmute(self.address as usize) };
+        unsafe { function(tick) };
+    }
+}
+
+impl HotFn<unsafe extern "C" fn(i32) -> i32> {
+    /// Call a `fn(i32) -> i32` with one argument.
+    ///
+    /// # Safety
+    ///
+    /// Same invariants as [`HotFn::from_address`].
+    pub unsafe fn call(&self, tick: i32) -> i32 {
+        let function: unsafe extern "C" fn(i32) -> i32 =
+            unsafe { std::mem::transmute(self.address as usize) };
+        unsafe { function(tick) }
+    }
+}
+
+impl HotFn<unsafe extern "C" fn(i32, i32) -> i32> {
+    /// Call a `fn(i32, i32) -> i32` with two arguments.
+    ///
+    /// # Safety
+    ///
+    /// Same invariants as [`HotFn::from_address`].
+    pub unsafe fn call(&self, x: i32, y: i32) -> i32 {
+        let function: unsafe extern "C" fn(i32, i32) -> i32 =
+            unsafe { std::mem::transmute(self.address as usize) };
+        unsafe { function(x, y) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-owned state — survives every patch and reload (con 5)
+// ---------------------------------------------------------------------------
+
+/// Mutable game state owned by the HOST process.  Because it lives here, it
+/// survives every leaf patch AND every full DLL reload — the game DLL only
+/// ever holds a pointer to it (via [`HostServices`]).
+#[derive(Default)]
+#[repr(C)]
+pub struct HostGameState {
+    /// Ticks executed since the process started (never reset by reloads).
+    pub total_ticks: i64,
+    /// A running score the game code can mutate freely.
+    pub score: i64,
+}
+
+/// Host-owned game state.
+pub static HOST_STATE: LazyLock<Mutex<HostGameState>> =
+    LazyLock::new(|| Mutex::new(HostGameState::default()));
+
+unsafe extern "C" fn host_get_state() -> *mut std::ffi::c_void {
+    let mut guard = HOST_STATE.lock().unwrap();
+    let state_pointer: *mut HostGameState = &mut *guard;
+    state_pointer as *mut std::ffi::c_void
+}
+
+/// C-ABI table of services the host hands to every loaded game DLL via its
+/// `set_services` export.  The game DLL stores this pointer and calls through
+/// it to reach host-owned state.
+#[repr(C)]
+pub struct HostServices {
+    /// Returns a pointer to the host-owned [`HostGameState`].
+    pub get_state: unsafe extern "C" fn() -> *mut std::ffi::c_void,
+}
+
+/// The service table handed to every loaded DLL.
+pub static HOST_SERVICES: HostServices = HostServices {
+    get_state: host_get_state,
+};
+
+/// Hand the host's service table to a freshly loaded DLL so its code can
+/// reach host-owned state.  DLLs that do not export `set_services` (older
+/// builds) are simply skipped.
+///
+/// # Safety
+///
+/// `handle` must be a valid module handle from [`load_library`].
+#[cfg(windows)]
+pub unsafe fn provide_services_to_dll(handle: *mut std::ffi::c_void) -> Result<(), String> {
+    let Ok(set_services_address) = (unsafe { resolve_export(handle, "set_services") }) else {
+        return Ok(());
+    };
+    let set_services: unsafe extern "C" fn(*const HostServices) =
+        unsafe { std::mem::transmute(set_services_address as usize) };
+    unsafe { set_services(&HOST_SERVICES) };
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +289,38 @@ unsafe extern "system" {
         dwSize: usize,
     ) -> i32;
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    // Thread enumeration (for safe patching — con 7).
+    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
+    fn Thread32First(hSnapshot: *mut std::ffi::c_void, lpte: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(hSnapshot: *mut std::ffi::c_void, lpte: *mut ThreadEntry32) -> i32;
+    fn OpenThread(
+        dwDesiredAccess: u32,
+        bInheritHandle: i32,
+        dwThreadId: u32,
+    ) -> *mut std::ffi::c_void;
+    fn SuspendThread(hThread: *mut std::ffi::c_void) -> u32;
+    fn ResumeThread(hThread: *mut std::ffi::c_void) -> u32;
+    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcessId() -> u32;
+}
+
+/// TH32CS_SNAPTHREAD — include all threads in the toolhelp snapshot.
+const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+/// THREAD_SUSPEND_RESUME — access right needed to suspend/resume a thread.
+const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
+
+/// `THREADENTRY32` from TlHelp32.h — one thread entry in a toolhelp snapshot.
+#[repr(C)]
+#[allow(non_snake_case)]
+struct ThreadEntry32 {
+    dwSize: u32,
+    cntUsage: u32,
+    th32ThreadID: u32,
+    th32OwnerProcessID: u32,
+    tpBasePri: i32,
+    tpDeltaPri: i32,
+    dwFlags: u32,
 }
 
 /// Handle to the currently-loaded base DLL, if any.
@@ -222,6 +431,66 @@ pub unsafe fn unload_current_dll() {
 }
 
 // ---------------------------------------------------------------------------
+// Thread suspension — safe patching (con 7)
+// ---------------------------------------------------------------------------
+
+/// Suspend every thread in this process except the current one, so code pages
+/// can be patched without another thread executing a torn instruction.
+/// Returns thread handles that must be passed to [`resume_threads`].
+///
+/// # Safety
+///
+/// Caller must not hold a lock that a suspended thread needs (deadlock), and
+/// must call [`resume_threads`] with the returned handles exactly once.
+#[cfg(windows)]
+unsafe fn suspend_other_threads() -> Vec<*mut std::ffi::c_void> {
+    let mut suspended = Vec::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() {
+        return suspended;
+    }
+
+    let current_process = unsafe { GetCurrentProcessId() };
+    let current_thread = unsafe { GetCurrentThreadId() };
+
+    let mut entry: ThreadEntry32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<ThreadEntry32>() as u32;
+
+    if unsafe { Thread32First(snapshot, &mut entry) } != 0 {
+        loop {
+            if entry.th32OwnerProcessID == current_process && entry.th32ThreadID != current_thread {
+                let thread_handle =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if !thread_handle.is_null() {
+                    unsafe { SuspendThread(thread_handle) };
+                    suspended.push(thread_handle);
+                }
+            }
+            if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+
+    unsafe { CloseHandle(snapshot) };
+    suspended
+}
+
+/// Resume every thread suspended by [`suspend_other_threads`].
+///
+/// # Safety
+///
+/// `suspended` must be the handles returned by [`suspend_other_threads`], and
+/// must not have been resumed already.
+#[cfg(windows)]
+unsafe fn resume_threads(suspended: &[*mut std::ffi::c_void]) {
+    for &handle in suspended {
+        unsafe { ResumeThread(handle) };
+        unsafe { CloseHandle(handle) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core Live Coding primitive — prologue patching
 // ---------------------------------------------------------------------------
 
@@ -279,51 +548,62 @@ pub unsafe fn patch_prologue(old_address: u64, new_address: u64) -> Result<(), S
 unsafe fn write_jmp_rel32(function_address: u64, relative: i32) -> Result<(), String> {
     let function_start = function_address as *mut u8;
 
-    // Make the code page writable, remembering the previous protection.
-    let mut old_protection: u32 = 0;
-    let protect_result = unsafe {
-        VirtualProtect(
-            function_start as *mut std::ffi::c_void,
-            JMP_REL32_SIZE,
-            PAGE_EXECUTE_READWRITE,
-            &mut old_protection,
-        )
-    };
-    if protect_result == 0 {
-        return Err(format!(
-            "VirtualProtect failed at {function_address:#x}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    // Suspend every other thread so no one executes the first 5 bytes while
+    // they are being overwritten (con 7: thread-safe patching).
+    let suspended = unsafe { suspend_other_threads() };
 
-    // Write the jmp rel32: E9 <little-endian rel32>.
-    unsafe {
-        *function_start = JMP_REL32_OPCODE;
-        let rel_bytes = relative.to_le_bytes();
-        std::ptr::copy_nonoverlapping(rel_bytes.as_ptr(), function_start.add(1), 4);
-    }
+    let patch_result = (|| -> Result<(), String> {
+        // Make the code page writable, remembering the previous protection.
+        let mut old_protection: u32 = 0;
+        let protect_result = unsafe {
+            VirtualProtect(
+                function_start as *mut std::ffi::c_void,
+                JMP_REL32_SIZE,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protection,
+            )
+        };
+        if protect_result == 0 {
+            return Err(format!(
+                "VirtualProtect failed at {function_address:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
 
-    // Flush the instruction cache so the CPU executes the new bytes.
-    unsafe {
-        FlushInstructionCache(
-            GetCurrentProcess(),
-            function_start as *const std::ffi::c_void,
-            JMP_REL32_SIZE,
-        );
-    }
+        // Write the jmp rel32: E9 <little-endian rel32>.
+        unsafe {
+            *function_start = JMP_REL32_OPCODE;
+            let rel_bytes = relative.to_le_bytes();
+            std::ptr::copy_nonoverlapping(rel_bytes.as_ptr(), function_start.add(1), 4);
+        }
 
-    // Restore the previous page protection.
-    let mut ignored_protection: u32 = 0;
-    unsafe {
-        VirtualProtect(
-            function_start as *mut std::ffi::c_void,
-            JMP_REL32_SIZE,
-            old_protection,
-            &mut ignored_protection,
-        );
-    }
+        // Flush the instruction cache so the CPU executes the new bytes.
+        unsafe {
+            FlushInstructionCache(
+                GetCurrentProcess(),
+                function_start as *const std::ffi::c_void,
+                JMP_REL32_SIZE,
+            );
+        }
 
-    Ok(())
+        // Restore the previous page protection.
+        let mut ignored_protection: u32 = 0;
+        unsafe {
+            VirtualProtect(
+                function_start as *mut std::ffi::c_void,
+                JMP_REL32_SIZE,
+                old_protection,
+                &mut ignored_protection,
+            );
+        }
+
+        Ok(())
+    })();
+
+    // Always resume, even if the patch failed.
+    unsafe { resume_threads(&suspended) };
+
+    patch_result
 }
 
 /// Allocate a trampoline near `old_address` that performs an absolute jump
@@ -341,6 +621,15 @@ unsafe fn write_jmp_rel32(function_address: u64, relative: i32) -> Result<(), St
 /// (leaked by design — it is executable code that may be jumped to forever).
 #[cfg(windows)]
 unsafe fn build_trampoline(old_address: u64, new_address: u64) -> Result<u64, String> {
+    // Reuse a cached trampoline for this target if it is reachable from the
+    // original function (con 8: resource growth).
+    if let Some(existing) = TRAMPOLINE_CACHE.lock().unwrap().get(&new_address).copied() {
+        let existing_relative = (existing as i64) - (old_address as i64 + JMP_REL32_SIZE as i64);
+        if existing_relative >= i32::MIN as i64 && existing_relative <= i32::MAX as i64 {
+            return Ok(existing);
+        }
+    }
+
     let low_bound = (old_address as i64 - 0x4000_0000).max(0) as u64; // −1 GB
     let high_bound = old_address as i64 + 0x4000_0000; // +1 GB
 
@@ -385,6 +674,11 @@ unsafe fn build_trampoline(old_address: u64, new_address: u64) -> Result<u64, St
                 unsafe {
                     FlushInstructionCache(GetCurrentProcess(), allocation, TRAMPOLINE_SIZE);
                 }
+                // Cache it so repeated far patches to this target reuse it.
+                TRAMPOLINE_CACHE
+                    .lock()
+                    .unwrap()
+                    .insert(new_address, allocation as u64);
                 return Ok(allocation as u64);
             }
         }
@@ -434,8 +728,33 @@ pub fn compile_single_function(
         format!(" -> {return_type}")
     };
 
+    // The generated module includes a `set_services` export (so the host can
+    // hand it the service table, making host-owned state reachable from
+    // patched code) plus a `host_state()` helper the body can call directly.
     let source_code = format!(
-        "#[unsafe(no_mangle)]\npub extern \"C\" fn {function_name}({params}){return_decl} {{\n    {function_body}\n}}\n"
+        "#[repr(C)]
+struct HostServices {{
+    get_state: unsafe extern \"C\" fn() -> *mut std::ffi::c_void,
+}}
+
+#[allow(dead_code)]
+static mut HOST_SERVICES_PTR: *const HostServices = core::ptr::null();
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn set_services(services: *const HostServices) {{
+    unsafe {{ HOST_SERVICES_PTR = services; }}
+}}
+
+#[allow(dead_code)]
+fn host_state() -> *mut std::ffi::c_void {{
+    unsafe {{ ((*HOST_SERVICES_PTR).get_state)() }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn {function_name}({params}){return_decl} {{
+    {function_body}
+}}
+"
     );
 
     let temp_dir = std::env::temp_dir();
@@ -490,6 +809,24 @@ pub fn compile_single_function(
 // High-level patch helpers
 // ---------------------------------------------------------------------------
 
+/// Free the previous patch DLL registered for `function_name` (if any) and
+/// delete its temp file.  Called AFTER the prologue is re-patched, when the
+/// old patch DLL is no longer referenced (con 8: resource growth).
+fn free_previous_patch_dll(function_name: &str) {
+    if let Some((handle_as_usize, path)) = PATCH_DLL_INFO.lock().unwrap().remove(function_name) {
+        unsafe { unload_library(handle_as_usize as *mut std::ffi::c_void) };
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Remember the currently-loaded patch DLL for `function_name`.
+fn record_patch_dll(function_name: &str, handle: *mut std::ffi::c_void, path: &std::path::Path) {
+    PATCH_DLL_INFO.lock().unwrap().insert(
+        function_name.to_string(),
+        (handle as usize, path.to_path_buf()),
+    );
+}
+
 /// Compile a replacement for an EXISTING function and patch its prologue in
 /// place.  Returns the path of the compiled patch DLL on success.
 ///
@@ -505,15 +842,27 @@ pub unsafe fn compile_and_patch_prologue(
     return_type: &str,
     original_address: u64,
 ) -> Result<std::path::PathBuf, String> {
+    let signature = format!("({params}) -> {return_type}");
+    // ABI guard: refuse to patch over a different signature (con 2 / 9).
+    verify_signature(function_name, &signature)?;
+
     let dll_path = compile_single_function(function_name, params, function_body, return_type)?;
     let handle = unsafe { load_library(&dll_path)? };
+
+    // Hand the host service table to the patched code (host-owned state).
+    unsafe { provide_services_to_dll(handle)? };
+
     let new_address = unsafe { resolve_export(handle, function_name)? };
 
     // Redirect the original function to the new code — in place, no wrapper.
     unsafe { patch_prologue(original_address, new_address)? };
 
-    // Remember the new address under the function name.
-    register_symbol(function_name, new_address);
+    // The old patch DLL is now unreferenced — free it, then record the new one.
+    free_previous_patch_dll(function_name);
+    record_patch_dll(function_name, handle, &dll_path);
+
+    // Remember the new address + signature under the function name.
+    register_function(function_name, new_address, &signature);
 
     Ok(dll_path)
 }
@@ -531,11 +880,17 @@ pub unsafe fn compile_and_register_new(
     function_body: &str,
     return_type: &str,
 ) -> Result<u64, String> {
+    let signature = format!("({params}) -> {return_type}");
+    verify_signature(function_name, &signature)?;
+
     let dll_path = compile_single_function(function_name, params, function_body, return_type)?;
     let handle = unsafe { load_library(&dll_path)? };
+    unsafe { provide_services_to_dll(handle)? };
     let new_address = unsafe { resolve_export(handle, function_name)? };
 
-    register_symbol(function_name, new_address);
+    free_previous_patch_dll(function_name);
+    record_patch_dll(function_name, handle, &dll_path);
+    register_function(function_name, new_address, &signature);
 
     Ok(new_address)
 }

@@ -34,6 +34,56 @@ pub fn alphssa() {
     println!("  alphasd111111aaaaaaaaaaaaaa1aaaaaaaaaaaaadwww123");
 }
 // ---------------------------------------------------------------------------
+// Host services — host-owned state that survives every patch and reload
+// ---------------------------------------------------------------------------
+
+/// Must match the host's `live_coding::HostServices` layout.
+#[repr(C)]
+struct HostServices {
+    get_state: unsafe extern "C" fn() -> *mut std::ffi::c_void,
+}
+
+/// Must match the host's `live_coding::HostGameState` layout.
+#[repr(C)]
+struct HostGameState {
+    total_ticks: i64,
+    score: i64,
+}
+
+static mut HOST_SERVICES_PTR: *const HostServices = std::ptr::null();
+
+/// Called by the host after every load/reload with its service table.
+#[unsafe(no_mangle)]
+#[allow(private_interfaces)]
+pub extern "C" fn set_services(services: *const HostServices) {
+    unsafe {
+        HOST_SERVICES_PTR = services;
+    }
+}
+
+/// Fallback scratch state used if `set_services` has not been called yet.
+static SCRATCH_STATE: std::sync::Mutex<HostGameState> = std::sync::Mutex::new(HostGameState {
+    total_ticks: 0,
+    score: 0,
+});
+
+/// Access the host-owned game state (never reset by patches or reloads).
+fn host_state() -> &'static mut HostGameState {
+    unsafe {
+        // The host calls set_services right after every load/reload, so this
+        // normally reaches the host-owned state directly.
+        let state_pointer = if HOST_SERVICES_PTR.is_null() {
+            // Fallback: borrow from the scratch buffer (its address is fixed).
+            let mut guard = SCRATCH_STATE.lock().unwrap();
+            &mut *guard as *mut HostGameState
+        } else {
+            ((*HOST_SERVICES_PTR).get_state)() as *mut HostGameState
+        };
+        &mut *state_pointer
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public exports — the hot-reloadable entry points
 // ---------------------------------------------------------------------------
 
@@ -53,11 +103,17 @@ struct bbb {
 /// Main game update — called every tick by the host.
 #[unsafe(no_mangle)]
 pub extern "C" fn update(tick: i32) {
-    println!("[game update] 123xxxxxtickZZZZawdwZZ1awd2asw3awd!aaa={tick}");
+    let state = host_state();
+    state.total_ticks += 1;
+    state.score += tick as i64;
+    println!(
+        "[game update] tick={tick} | host state: total_ticks={}, score={} (survives reload)",
+        state.total_ticks, state.score
+    );
     alpha();
     test::alpha();
     let a = aaa { a: 1, b: 2, c: 3 };
-    println!("  aaa struct: a={}, b={}, c={}", a.a, a.b, a.c);
+    println!("  AWDWaAWDAWDaa struct: a={}, b={}, c={}", a.a, a.b, a.c);
     let b = bbb {
         a: 4,
         b: 5,
