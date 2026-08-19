@@ -741,9 +741,9 @@ fn strip_hot_bodies(source: &str, hot_names: &std::collections::HashSet<String>)
         };
 
         // For a private helper, decide strip (hot at root) vs keep (non-hot
-        // or name-colliding lib helper).  `hot_names` here carries only
-        // root-scope hot names, so a lib `scale_value_003` that collides with
-        // `modules::module_003::scale_value_003` is kept whole.
+        // infrastructure).  `hot_names` here carries only root-scope hot
+        // names, so every hot lib helper (including one that shares a bare
+        // name with a module function) is stripped and stays hot-patchable.
         let mut should_strip = true;
         if matches!(kind, MarkerKind::Private) {
             let marker_len = b"fn ".len();
@@ -1141,12 +1141,12 @@ struct HotSymbol {
 /// sample/scale/offset as plain `pub fn`), then lib.rs (project_update plus
 /// private helpers like `get_aaa`/`scale_value_003`).  Plumbing
 /// (project_set_api / project_init / project_resolve_symbol) and
-/// infrastructure (`state`, `spawn_default_quads`) are not hot.  Module-graph
-/// names win collisions, so a lib helper named like a module function (e.g.
-/// `scale_value_003`) is left non-hot (full rebuild on edit).
+/// infrastructure (`state`, `spawn_default_quads`) are not hot.  Symbols are
+/// keyed by their fully-qualified path (see `symbol_path`), so a lib helper
+/// and a module function sharing a bare name (lib `scale_value_003` vs
+/// `modules::module_003::scale_value_003`) are BOTH hot.
 fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> {
-    // Process non-lib files first so module-graph names take precedence over
-    // colliding lib.rs helper names.
+    // Process non-lib files first (module graph before lib.rs), stable order.
     let mut order: Vec<&(PathBuf, String)> = project_sources.iter().collect();
     order.sort_by_key(|(path, _)| {
         let is_lib = path.file_name().map_or(false, |name| name == "lib.rs");
@@ -1185,10 +1185,11 @@ fn collect_hot_symbols(project_sources: &[(PathBuf, String)]) -> Vec<HotSymbol> 
                 || name == "resolve_hot_symbol"
                 || name == "state"
                 || name == "spawn_default_quads";
-            // Skip infrastructure and any name that a module already owns
-            // (module-graph names take precedence because they are processed
-            // first).
-            if is_infra || symbols.iter().any(|symbol| symbol.name == name) {
+            // Skip infrastructure only.  No name-collision check: symbols are
+            // keyed by qualified path, so duplicate bare names across scopes
+            // (lib `scale_value_003` vs `modules::module_003::scale_value_003`)
+            // are both hot.
+            if is_infra {
                 continue;
             }
             let index = symbols.len();
@@ -1246,6 +1247,11 @@ fn parse_params(params: &str) -> (Vec<String>, Vec<String>) {
 /// Rust path expression that reaches a hot symbol inside the patch module
 /// (used by the generated resolver): `project_update`, `modules::run_update`,
 /// `modules::module_000::tick_000`, ...
+/// The resolver key AND Rust path of a hot symbol: bare name for lib.rs
+/// top-level functions, fully-qualified path otherwise.  Because keys are
+/// qualified, a lib helper and a module function can share a bare name (lib
+/// `scale_value_003` vs `modules::module_003::scale_value_003`) and both stay
+/// hot - each is resolved by its distinct qualified key.
 fn symbol_path(symbol: &HotSymbol) -> String {
     match symbol.scope.as_str() {
         "top" => symbol.name.clone(),
@@ -1259,19 +1265,22 @@ fn symbol_path(symbol: &HotSymbol) -> String {
 /// function, or a forwarding wrapper that jumps through the dependency table
 /// to the base DLL's copy of the function.
 fn build_hot_definition(
+    key: &str,
     name: &str,
     params: &str,
     ret: &str,
     body: &str,
     index: usize,
-    changed_name: &str,
+    changed_key: &str,
 ) -> String {
     let ret_suffix = if ret.is_empty() {
         String::new()
     } else {
         format!(" -> {ret}")
     };
-    if name == changed_name {
+    // Real body only for the exact changed function (compared by qualified
+    // key, so a lib/module name twin never both gets a real body).
+    if key == changed_key {
         // The changed function gets its real new body.
         format!("pub fn {name}({params}){ret_suffix} {{\n{body}\n}}\n")
     } else {
@@ -1296,7 +1305,7 @@ fn build_hot_definition(
 /// symbol that lives inside the module graph becomes a forwarding wrapper
 /// (or the real body if it is the changed function), preserving the exact
 /// `crate::modules::module_NNN::...` paths the function bodies use.
-fn build_modules_skeleton(symbols: &[HotSymbol], changed_name: &str) -> String {
+fn build_modules_skeleton(symbols: &[HotSymbol], changed_key: &str) -> String {
     // Group the graph symbols by module, preserving first-seen order.
     let mut module_order: Vec<String> = Vec::new();
     let mut module_defs: std::collections::HashMap<String, Vec<String>> =
@@ -1304,12 +1313,13 @@ fn build_modules_skeleton(symbols: &[HotSymbol], changed_name: &str) -> String {
     let mut root_defs: Vec<String> = Vec::new();
     for symbol in symbols {
         let definition = build_hot_definition(
+            &symbol_path(symbol),
             &symbol.name,
             &symbol.params,
             &symbol.ret,
             &symbol.body,
             symbol.index,
-            changed_name,
+            changed_key,
         );
         if symbol.scope == "modules" {
             root_defs.push(definition);
@@ -1351,14 +1361,14 @@ fn build_modules_skeleton(symbols: &[HotSymbol], changed_name: &str) -> String {
 /// take effect: the base prologue of the changed function is patched to this
 /// module, and its calls hit the base (whose own prologues can be patched
 /// later too - patches compose).
-fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_name: &str) -> String {
+fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_key: &str) -> String {
     let consts = extract_top_level_consts(lib_source).join("\n");
     let type_definitions = extract_top_level_type_definitions(lib_source).join("\n");
-    // Inject non-hot lib helpers only - hot helpers (get_aaa, scale_value_003)
-    // are emitted as wrappers/real-bodies in `top_definitions` instead, so
-    // injecting them again here would be a duplicate definition.  A lib
-    // helper whose name collides with a MODULE function (e.g. a lib
-    // `scale_value_003`) is NOT hot (module names win) and must be kept.
+    // Inject non-hot lib helpers only - hot helpers (get_aaa, scale_value_003,
+    // project_update) are emitted as wrappers/real-bodies in `top_definitions`
+    // instead, so injecting them again here would be a duplicate definition.
+    // Non-hot helpers (infrastructure like `state`/`spawn_default_quads`) are
+    // kept as-is.
     let helper_functions = extract_top_level_functions(lib_source)
         .into_iter()
         .filter(|definition| {
@@ -1370,7 +1380,7 @@ fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_na
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let modules_skeleton = build_modules_skeleton(symbols, changed_name);
+    let modules_skeleton = build_modules_skeleton(symbols, changed_key);
 
     // The top-level hot symbol (project_update): real body if it is the one
     // being patched, otherwise a forwarding wrapper.
@@ -1379,12 +1389,13 @@ fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_na
         .filter(|symbol| symbol.scope == "top")
         .map(|symbol| {
             build_hot_definition(
+                &symbol_path(symbol),
                 &symbol.name,
                 &symbol.params,
                 &symbol.ret,
                 &symbol.body,
                 symbol.index,
-                changed_name,
+                changed_key,
             )
         })
         .collect::<Vec<_>>()
@@ -1395,11 +1406,8 @@ fn build_patch_module_source(lib_source: &str, symbols: &[HotSymbol], changed_na
     let resolver_arms = symbols
         .iter()
         .map(|symbol| {
-            format!(
-                "        {:?} => {} as usize,",
-                symbol.name,
-                symbol_path(symbol)
-            )
+            let path = symbol_path(symbol);
+            format!("        {path:?} => {path} as usize,")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1538,9 +1546,9 @@ struct ProjectSession {
     /// Address of `project_update` in the very first base DLL - the engine
     /// pointer target.  Its prologue is what every full reload re-patches.
     base_update_address: Option<usize>,
-    /// Canonical hot-symbol names (order == dependency-table order), from the
-    /// most recently fully-built DLL.
-    hot_names: Vec<String>,
+    /// Canonical hot-symbol qualified paths (order == dependency-table
+    /// order), from the most recently fully-built DLL.
+    hot_keys: Vec<String>,
     /// Base-DLL addresses of the hot symbols (same order).  These are the
     /// prologue-patch targets AND the dependency table handed to every patch
     /// DLL, so a patched function calls back into the base (single source of
@@ -1562,7 +1570,7 @@ impl ProjectSession {
         Self {
             api,
             base_update_address: None,
-            hot_names: Vec::new(),
+            hot_keys: Vec::new(),
             base_symbols: Vec::new(),
             change_count: 0,
             cached_funcs: Vec::new(),
@@ -1596,13 +1604,15 @@ impl ProjectSession {
                 // dependency table handed to future patch DLLs.
                 let project_sources = collect_project_sources();
                 let hot_symbols = collect_hot_symbols(&project_sources);
-                self.hot_names = hot_symbols
+                self.hot_keys = hot_symbols
                     .iter()
-                    .map(|symbol| symbol.name.clone())
+                    .map(|symbol| symbol_path(symbol))
                     .collect();
                 self.base_symbols = hot_symbols
                     .iter()
-                    .map(|symbol| resolve_symbol_address(&library, &symbol.name).unwrap_or(0))
+                    .map(|symbol| {
+                        resolve_symbol_address(&library, &symbol_path(symbol)).unwrap_or(0)
+                    })
                     .collect();
 
                 self.base_update_address = Some(update_address);
@@ -1629,7 +1639,7 @@ impl ProjectSession {
                 }
                 for symbol in &hot_symbols {
                     self.upsert_cached((
-                        symbol.name.clone(),
+                        symbol_path(symbol),
                         symbol.params.clone(),
                         symbol.body.clone(),
                         symbol.ret.clone(),
@@ -1682,7 +1692,7 @@ impl ProjectSession {
         // Rebuild the canonical symbol list from the current source so the
         // patch module's dependency-table indices match the host's table.
         let symbols = collect_hot_symbols(project_sources);
-        let module_source = build_patch_module_source(lib_source, &symbols, &changed.name);
+        let module_source = build_patch_module_source(lib_source, &symbols, &symbol_path(changed));
         let compile_start = Instant::now();
         println!("    rustc compiling standalone module...");
         let dll_path = mini_engine::patch::compile_rust_source(&module_source, "project_patch")?;
@@ -1709,7 +1719,7 @@ impl ProjectSession {
             set_dependencies(self.base_symbols.as_ptr());
         };
 
-        let new_address = resolve_symbol_address(&library, &changed.name)
+        let new_address = resolve_symbol_address(&library, &symbol_path(changed))
             .ok_or_else(|| format!("{} not exported by patch DLL", changed.name))?;
         let old_address = self
             .base_symbols
@@ -1759,13 +1769,15 @@ impl ProjectSession {
                 // address in it (prologue-patch targets + dependency table).
                 let project_sources = collect_project_sources();
                 let hot_symbols = collect_hot_symbols(&project_sources);
-                self.hot_names = hot_symbols
+                self.hot_keys = hot_symbols
                     .iter()
-                    .map(|symbol| symbol.name.clone())
+                    .map(|symbol| symbol_path(symbol))
                     .collect();
                 self.base_symbols = hot_symbols
                     .iter()
-                    .map(|symbol| resolve_symbol_address(&library, &symbol.name).unwrap_or(0))
+                    .map(|symbol| {
+                        resolve_symbol_address(&library, &symbol_path(symbol)).unwrap_or(0)
+                    })
                     .collect();
 
                 println!(
@@ -1866,10 +1878,9 @@ impl ProjectSession {
         let symbols = collect_hot_symbols(&project_sources);
 
         // Strip hot-function bodies (private lib helpers only when hot) so a
-        // hot body edit counts as a body-only change.  Use ROOT-scope names
-        // only: a lib helper whose name collides with a module function (e.g.
-        // lib `scale_value_003` vs `modules::module_003::scale_value_003`) is
-        // NOT hot and its body must be kept so edits to it are detected.
+        // hot body edit counts as a body-only change.  ROOT-scope names only:
+        // with qualified keys, every unique-name lib helper is hot (scope
+        // "top"), so its body is stripped and edits are hot-patchable.
         let root_hot_names: std::collections::HashSet<String> = symbols
             .iter()
             .filter(|symbol| symbol.scope == "top")
@@ -1889,9 +1900,18 @@ impl ProjectSession {
             .filter(|entry| !symbols.iter().any(|symbol| symbol.name == entry.0))
             .cloned()
             .collect();
-        let mut tracked: Vec<(String, String, String, String)> = plumbing_only.clone();
+        // (qualified key, display name, params, body, ret) - the KEY is the
+        // fully-qualified path, so a lib helper and a module function that
+        // share a bare name are tracked as two distinct entries.
+        let mut tracked: Vec<(String, String, String, String, String)> = plumbing_only
+            .iter()
+            .map(|(name, params, body, ret)| {
+                (name.clone(), name.clone(), params.clone(), body.clone(), ret.clone())
+            })
+            .collect();
         for symbol in &symbols {
             tracked.push((
+                symbol_path(symbol),
                 symbol.name.clone(),
                 symbol.params.clone(),
                 symbol.body.clone(),
@@ -1906,7 +1926,7 @@ impl ProjectSession {
             paint_bright_cyan(&plumbing_only.len().to_string())
         );
         for entry in &tracked {
-            let status_text = if self.is_cached(&entry.0, &entry.2) {
+            let status_text = if self.is_cached(&entry.0, &entry.3) {
                 "unchanged"
             } else {
                 "CHANGED"
@@ -1917,16 +1937,16 @@ impl ProjectSession {
             } else {
                 paint_dim(&padded)
             };
-            let signature = if entry.3.is_empty() {
-                format!("({})", entry.1)
+            let signature = if entry.4.is_empty() {
+                format!("({})", entry.2)
             } else {
-                format!("({}) -> {}", entry.1, entry.3)
+                format!("({}) -> {}", entry.2, entry.4)
             };
             println!(
-                "    {:<16} {} body={:>3} chars  sig={}",
+                "    {:<44} {} body={:>3} chars  sig={}",
                 entry.0,
                 status,
-                entry.2.len(),
+                entry.3.len(),
                 signature
             );
         }
@@ -1958,7 +1978,7 @@ impl ProjectSession {
         // Decide: which hot functions changed, and is ANYTHING non-hot-patchable?
         let changed_symbols: Vec<&HotSymbol> = symbols
             .iter()
-            .filter(|symbol| !self.is_cached(&symbol.name, &symbol.body))
+            .filter(|symbol| !self.is_cached(&symbol_path(symbol), &symbol.body))
             .collect();
 
         // Anything below forces a full rebuild:
@@ -1971,8 +1991,10 @@ impl ProjectSession {
                 || entry.0 == "project_resolve_symbol")
                 && !self.is_cached(&entry.0, &entry.2)
         });
-        let structure_changed = symbols.len() != self.hot_names.len()
-            || symbols.iter().any(|symbol| !self.hot_names.contains(&symbol.name));
+        let structure_changed = symbols.len() != self.hot_keys.len()
+            || symbols
+                .iter()
+                .any(|symbol| !self.hot_keys.contains(&symbol_path(symbol)));
 
         let full_rebuild_needed = stripped_changed || plumbing_changed || structure_changed;
 
@@ -2036,7 +2058,7 @@ impl ProjectSession {
             if patched_all {
                 for changed in &changed_symbols {
                     self.upsert_cached((
-                        changed.name.clone(),
+                        symbol_path(changed),
                         changed.params.clone(),
                         changed.body.clone(),
                         changed.ret.clone(),
@@ -2049,7 +2071,12 @@ impl ProjectSession {
         // Full-rebuild fallback (or the change wasn't hot-patchable).
         if self.full_reload(engine, "hot-ineligible or per-function patch failed") {
             for entry in &tracked {
-                self.upsert_cached(entry.clone());
+                self.upsert_cached((
+                    entry.0.clone(),
+                    entry.2.clone(),
+                    entry.3.clone(),
+                    entry.4.clone(),
+                ));
             }
         }
     }

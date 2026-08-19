@@ -195,11 +195,11 @@ fn spawn_default_quads(game_state: &mut GameState, screen_width: f32, screen_hei
 }
 
 fn get_aaa() -> i32 {
-    6
+    56
 }
 
 fn scale_value_0032(input: i32, factor: i32) -> i32 {
-    input * factor * get_aaa() * 6
+    input * factor * get_aaa() * 8
 }
 
 /// The engine calls this every frame.  Animate the engine-owned quads so they
@@ -212,7 +212,7 @@ pub extern "C" fn project_update(delta_time: f32) {
 
     let screen_width = unsafe { ((*API).screen_width)() };
 
-    scale_value_0032(game_state.tick as i32, 8);
+    scale_value_0032(game_state.tick as i32, 1);
 
     // Fan out into the interconnected module graph and fold the results into
     // a small "tuning noise" that perturbs the jump.  This makes the whole

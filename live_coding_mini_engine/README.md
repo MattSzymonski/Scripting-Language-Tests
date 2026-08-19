@@ -91,11 +91,19 @@ Press `Escape` to quit.
   export-table pollution — the DLL exports only `project_set_api`,
   `project_init`, `project_update` and `project_resolve_symbol`).  The
   host resolves any hot function's address by calling
-  `project_resolve_symbol(name)`.  The name→address registry itself is
-  **generated into `OUT_DIR` by the project's `build.rs`** (it scans
-  `src/**` for `pub fn` / `pub extern "C" fn`), so **adding a function or
+  `project_resolve_symbol(name)`.  The registry is **generated into
+  `OUT_DIR` by the project's `build.rs`** (it scans `src/**` for `pub fn` /
+  `pub extern "C" fn` / private lib helpers), so **adding a function or
   module needs no manual declaration** — just write it and rebuild; even a
   patch DLL gets its own generated resolver.
+- **Qualified registry keys (no name collisions)**: every hot symbol is
+  keyed by its fully-qualified path — bare name for lib.rs top-level
+  functions (`get_aaa`, `project_update`), `modules::run_update` for
+  `modules.rs`, `modules::module_003::scale_value_003` for module files.
+  A lib helper that shares a bare name with a module function (lib
+  `scale_value_003` vs `modules::module_003::scale_value_003`) is a
+  **different key**, so both are hot — no renaming needed; editing either
+  patches it in place.
 - **Patches call back into the base DLL (no dependency islands)**: a patch
   module contains the changed function's real new body plus a **thin
   forwarding wrapper for every other hot symbol**, each jumping through a
@@ -125,8 +133,10 @@ The project is deliberately grown to stress the live-coding paths:
   They are dead code on the hot path, so they only add full-rebuild cost; the
   leaf patch never sees them.
 - `build.rs` — scans `src/**` and auto-generates the hot-symbol registry
-  (`resolve_hot_symbol`) into `OUT_DIR`, included by `lib.rs`.  No function
-  or module ever has to be listed by hand.
+  (`resolve_hot_symbol`) into `OUT_DIR`, included by `lib.rs`.  Every entry
+  is keyed by its fully-qualified path, so lib helpers and module functions
+  sharing a bare name never collide.  No function or module ever has to be
+  listed by hand.
 - Regenerate the graph or the bloat with `python generate_modules.py
   [--count N]` and `python gen_bloat.py [--count N]` from
   `live_coding_mini_engine/`.
@@ -147,8 +157,8 @@ base DLL (loaded once, single source of truth)      patch DLL (per changed fn)
 └────────────────────────────────────────────┘     └──────────────────────────────┘
 ```
 
-1. **Startup** — the base DLL is loaded once and every hot-exported function's
-   address is resolved by name into the host's symbol table.
+1. **Startup** — the base DLL is loaded once and every hot function's address
+   is resolved by its fully-qualified path into the host's symbol table.
 2. **Edit a hot function** — its new body is compiled standalone; every OTHER
    hot function in the patch module becomes a forwarding wrapper that jumps
    through the dependency table to the base DLL's copy.
