@@ -1,0 +1,11 @@
+[package]
+name = "mini_engine"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny macroquad engine that renders jumping quads driven by a hot-reloadable project DLL"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+macroquad = "0.4"

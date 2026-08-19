@@ -1,0 +1,10 @@
+[package]
+name = "project"
+version = "0.1.0"
+edition = "2021"
+description = "Hot-reloadable game logic for the mini engine - jumping quads"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

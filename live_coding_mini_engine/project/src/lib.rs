@@ -1,0 +1,192 @@
+// REQUIREMENTS
+//   Rust (stable).  Compiled as a cdylib by the standalone host.  Must NOT
+//   link macroquad (a second macroquad state would be disconnected from the
+//   host's window) - it talks to the engine only through the ProjectApi table.
+//
+// DESCRIPTION
+//   Hot-reloadable game logic ("project") for the mini engine.  Exports
+//   project_set_api (receives the engine's function-pointer table),
+//   project_init (applies the quad settings on every load/reload) and
+//   project_update (called by the engine every frame).  The quad settings
+//   (count, colours, sizes, speeds, jump behaviour) are defined HERE, in the
+//   project - not in the engine.
+//
+// USAGE
+//   Built automatically by `cargo run -p standalone` from the workspace root.
+//   Edit this file while the game runs and save to live-reload.
+//
+// EXAMPLE USAGE
+//   cargo run -p standalone        # from live_coding_mini_engine/
+//
+// --- SCRIPT ---
+
+use std::ffi::c_void;
+
+/// Mirror of `mini_engine::ProjectApi` - must match field-for-field, in order.
+#[repr(C)]
+struct ProjectApi {
+    get_state: extern "C" fn() -> *mut c_void,
+    screen_width: extern "C" fn() -> f32,
+    screen_height: extern "C" fn() -> f32,
+}
+
+/// Mirror of `mini_engine::Quad` - must match field-for-field, in order.
+#[repr(C)]
+struct Quad {
+    x: f32,
+    y: f32,
+    base_y: f32,
+    w: f32,
+    h: f32,
+    vx: f32,
+    jump_phase: f32,
+    jump_speed: f32,
+    jump_height: f32,
+    color: u32,
+}
+
+/// Mirror of `mini_engine::GameState` - must match field-for-field, in order.
+#[repr(C)]
+struct GameState {
+    tick: f32,
+    quad_count: usize,
+    quads: [Quad; MAX_QUADS],
+}
+
+/// Must match `mini_engine::MAX_QUADS`.
+const MAX_QUADS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Quad settings - edit any of these and save to live-reload; project_init
+// re-applies them on every load.
+// ---------------------------------------------------------------------------
+
+/// Width and height of every spawned quad, in pixels.
+const QUAD_SIZE: f32 = 46.0;
+/// One colour (0xRRGGBBAA) per quad, in spawn order.
+const QUAD_COLOURS: [u32; MAX_QUADS] = [
+    0xFF_FF6B6B,
+    0xFF_FFD93D,
+    0xFF_6BCB77,
+    0xFF_4D96FF,
+    0xFF_9B5DE5,
+    0xFF_F15BB5,
+    0xFF_FEE440,
+    0xFF_00BBF9,
+];
+/// Rest height of the first quad, as a fraction of the screen height.
+const QUAD_BASE_Y_MIN_FRACTION: f32 = 0.25;
+/// Vertical span covered by the rest heights, as a fraction of screen height.
+const QUAD_BASE_Y_SPAN_FRACTION: f32 = 0.6;
+/// Initial horizontal drift speed of the first quad (px/s).
+const QUAD_INITIAL_VELOCITY_X: f32 = 70.0;
+/// Extra horizontal drift speed added per quad index (px/s).
+const QUAD_VELOCITY_X_STEP: f32 = 23.0;
+/// Jump oscillation speed of the first quad (rad/s).
+const QUAD_INITIAL_JUMP_SPEED: f32 = 1.6;
+/// Extra jump oscillation speed added per quad index (rad/s).
+const QUAD_JUMP_SPEED_STEP: f32 = 0.35;
+/// Jump height of the first quad (px).
+const QUAD_INITIAL_JUMP_HEIGHT: f32 = 40.0;
+/// Extra jump height added per quad index (px).
+const QUAD_JUMP_HEIGHT_STEP: f32 = 14.0;
+/// Half-size factor used to centre a quad on its x/y position.
+const QUAD_HALF_SIZE_FACTOR: f32 = 0.5;
+
+/// The engine's API table, stored when the host calls `project_set_api`.
+static mut API: *const ProjectApi = std::ptr::null();
+
+struct test {
+    internal: i32,
+    external: i32,
+}
+
+/// Called by the host right after every load/reload with the engine's API
+/// table.  The engine owns the state; we only get a pointer to it.
+#[unsafe(no_mangle)]
+#[allow(private_interfaces)]
+pub extern "C" fn project_set_api(api: *const ProjectApi) {
+    unsafe {
+        API = api;
+    }
+}
+
+/// Borrow the engine-owned game state through the API table.
+fn state() -> &'static mut GameState {
+    unsafe {
+        let api = API;
+        // Contract: the host calls project_set_api before project_update is
+        // ever invoked (it does - during load, before patching the table).
+        assert!(
+            !api.is_null(),
+            "project_set_api must be called before update"
+        );
+        let state_pointer = ((*api).get_state)() as *mut GameState;
+        &mut *state_pointer
+    }
+}
+
+/// The host calls this after every load/reload to (re)apply the quad settings
+/// defined below.  Because it runs on every reload, editing the settings and
+/// saving re-applies them live (at the cost of resetting the quads' initial
+/// placement).
+#[unsafe(no_mangle)]
+pub extern "C" fn project_init() {
+    let game_state = state();
+    let screen_width = unsafe { ((*API).screen_width)() };
+    let screen_height = unsafe { ((*API).screen_height)() };
+    spawn_default_quads(game_state, screen_width, screen_height);
+}
+
+/// Spawn the default spread of quads, applying the settings above.
+fn spawn_default_quads(game_state: &mut GameState, screen_width: f32, screen_height: f32) {
+    if screen_width <= 0.0 || screen_height <= 0.0 {
+        return;
+    }
+
+    let count = QUAD_COLOURS.len();
+    for (index, quad) in game_state.quads.iter_mut().enumerate().take(count) {
+        // Horizontal position: spread evenly across the window width.
+        let fraction = (index as f32 + 1.0) / (count as f32 + 1.0);
+        quad.w = QUAD_SIZE;
+        quad.h = QUAD_SIZE;
+        quad.x = screen_width * fraction;
+        // Rest height: a vertical band between the min and min+span.
+        quad.base_y = screen_height
+            * (QUAD_BASE_Y_MIN_FRACTION
+                + QUAD_BASE_Y_SPAN_FRACTION * (index as f32 / count as f32));
+        quad.y = quad.base_y;
+        quad.vx = QUAD_INITIAL_VELOCITY_X + index as f32 * QUAD_VELOCITY_X_STEP;
+        quad.jump_speed = QUAD_INITIAL_JUMP_SPEED + index as f32 * QUAD_JUMP_SPEED_STEP;
+        quad.jump_height = QUAD_INITIAL_JUMP_HEIGHT + index as f32 * QUAD_JUMP_HEIGHT_STEP;
+        quad.color = QUAD_COLOURS[index];
+    }
+    game_state.quad_count = count;
+}
+
+/// The engine calls this every frame.  Animate the engine-owned quads so they
+/// jump around the window - tweak anything here while the game runs and save
+/// to live-reload.
+#[unsafe(no_mangle)]
+pub extern "C" fn project_update(delta_time: f32) {
+    let game_state = state();
+    game_state.tick += delta_time;
+
+    let screen_width = unsafe { ((*API).screen_width)() };
+
+    for quad in game_state.quads[..game_state.quad_count].iter_mut() {
+        // Half the quad's width, used to centre it on its x position.
+        let half_width = quad.w * QUAD_HALF_SIZE_FACTOR;
+
+        // Drift sideways and bounce off the window edges.
+        quad.x += quad.vx * delta_time;
+        if quad.x < half_width || quad.x > screen_width - half_width {
+            quad.vx = -quad.vx;
+            quad.x = quad.x.clamp(half_width, screen_width - half_width - 1.0);
+        }
+
+        // Jump: y oscillates between base_y and base_y - jump_height.
+        quad.jump_phase += quad.jump_speed * delta_time;
+        quad.y = quad.base_y - quad.jump_phase.sin().abs() * quad.jump_height;
+    }
+}
