@@ -182,7 +182,7 @@ pub extern "C" fn project_update(delta_time: f32) {
         quad.x += quad.vx * delta_time;
         if quad.x < half_width || quad.x > screen_width - half_width {
             quad.vx = -quad.vx;
-            quad.x = quad.x.clamp(half_width, screen_width - half_width - 1.0);
+            quad.x = quad.x.clamp(half_width, screen_width - half_width - 2.0);
         }
 
         // Jump: y oscillates between base_y and base_y - jump_height.

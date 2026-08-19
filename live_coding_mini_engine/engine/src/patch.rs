@@ -317,8 +317,13 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
 // Single-function compilation via rustc
 // ---------------------------------------------------------------------------
 
-/// Write `source_code` to a unique temp `.rs` and compile it to a cdylib with
+/// Write `source_code` to a fixed temp `.rs` and compile it to a cdylib with
 /// `rustc` directly (bypassing cargo).  Returns the compiled DLL path.
+///
+/// The SOURCE path and the incremental cache directory are fixed per crate
+/// name, so repeated leaf compiles reuse rustc's incremental state (only the
+/// changed body gets re-codegened).  The output DLL stays unique per compile,
+/// because a previously loaded patch DLL locks its file on Windows.
 pub fn compile_rust_source(
     source_code: &str,
     crate_name: &str,
@@ -327,11 +332,14 @@ pub fn compile_rust_source(
 
     let temp_dir = std::env::temp_dir();
     let pid = std::process::id();
-    // Monotonic counter so every compilation gets a unique filename even
+    // Monotonic counter so every compilation gets a unique DLL filename even
     // within the same process (PID alone isn't enough for repeated reloads).
     static COMPILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = COMPILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let source_path = temp_dir.join(format!("{crate_name}_{pid}_{counter}.rs"));
+    // Fixed source path + persistent incremental dir (keyed by crate name) so
+    // rustc's incremental cache is reused across compiles.
+    let source_path = temp_dir.join(format!("{crate_name}_leaf.rs"));
+    let incremental_dir = temp_dir.join(format!("{crate_name}_leaf_incr"));
     let dll_path = temp_dir.join(format!("{crate_name}_{pid}_{counter}.dll"));
 
     let mut file = std::fs::File::create(&source_path)
@@ -345,6 +353,7 @@ pub fn compile_rust_source(
         .arg(crate_name)
         .args(["--edition", "2021", "-o"])
         .arg(&dll_path)
+        .args(["-C", &format!("incremental={}", incremental_dir.display())])
         .arg(&source_path)
         .output()
         .map_err(|e| format!("failed to run rustc: {e}"))?;
