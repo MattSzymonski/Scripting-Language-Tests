@@ -3,6 +3,7 @@ name = "project"
 version = "0.1.0"
 edition = "2021"
 description = "Hot-reloadable game logic for the mini engine - jumping quads"
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]

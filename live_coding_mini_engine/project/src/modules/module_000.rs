@@ -6,7 +6,7 @@
 /// input frame and folds in values pulled from other modules' leaf functions.
 pub fn tick_000(input: i32) -> i32 {
     let local = (input * 7 + 0) % 1000;
-    let sample_003 = crate::modules::module_003::sample_003(local + 3);
+    let sample_003 = crate::modules::module_003::sample_003(local + 1);
     let sample_007 = crate::modules::module_007::sample_007(local + 7);
     (local + sample_003 + sample_007) % 100000
 }

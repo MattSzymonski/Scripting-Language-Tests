@@ -212,33 +212,8 @@ def build_modules_file(module_count: int) -> str:
     fold_parts = " + ".join(f"part_{module_index:03d}" for module_index in range(module_count))
     lines.append(f"    ({fold_parts}) % 100000")
     lines.append("}")
-    # The single address-lookup entry point: the host calls lib.rs's exported
-    # project_resolve_symbol, which forwards here for every graph function.
-    lines.extend(
-        [
-            "",
-            "/// Resolve a graph function's address by name.  `pub(crate)` so it is",
-            "/// not itself treated as a hot function; reachable from lib.rs.",
-            "pub(crate) fn resolve_hot_symbol(name: &str) -> usize {",
-            "    match name {",
-            '        "run_update" => run_update as usize,',
-            '        "run_compute" => run_compute as usize,',
-        ]
-    )
-    for module_index in range(module_count):
-        index_str = f"{module_index:03d}"
-        lines.append(f'        "tick_{index_str}" => module_{index_str}::tick_{index_str} as usize,')
-        lines.append(f'        "compute_{index_str}" => module_{index_str}::compute_{index_str} as usize,')
-        lines.append(f'        "sample_{index_str}" => module_{index_str}::sample_{index_str} as usize,')
-        lines.append(f'        "scale_value_{index_str}" => module_{index_str}::scale_value_{index_str} as usize,')
-        lines.append(f'        "offset_value_{index_str}" => module_{index_str}::offset_value_{index_str} as usize,')
-    lines.extend(
-        [
-            "        _ => 0,",
-            "    }",
-            "}",
-        ]
-    )
+    # NOTE: the hot-symbol registry (name -> address) is NOT emitted here any
+    # more - the crate's build.rs scans src/** and generates it into OUT_DIR.
     return "\n".join(lines) + "\n"
 
 

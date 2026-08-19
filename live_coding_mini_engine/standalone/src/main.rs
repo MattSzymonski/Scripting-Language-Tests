@@ -546,59 +546,6 @@ fn extract_public_functions(source: &str) -> Vec<(String, String, String, String
     results
 }
 
-/// Return `source` with the BODY of every `pub extern "C" fn` removed (the
-/// signatures are kept).  Used to tell "only a function body changed" (fast
-/// prologue patch) from "non-body content changed" (full rebuild).
-fn strip_extern_bodies(source: &str) -> String {
-    let mask = code_mask(source);
-    let bytes = source.as_bytes();
-    let mut result = String::new();
-    let mut i = 0usize;
-    let n = bytes.len();
-
-    while let Some(start) = find_extern_marker(bytes, &mask, i) {
-        result.push_str(&source[i..start]);
-        let mut k = start;
-        let mut open: Option<usize> = None;
-        while k < n {
-            if mask[k] && bytes[k] == b'{' {
-                open = Some(k);
-                break;
-            }
-            k += 1;
-        }
-        let Some(open) = open else {
-            result.push_str(&source[start..]);
-            return result;
-        };
-        result.push_str(&source[start..=open]);
-        let mut depth = 1u32;
-        let mut close: Option<usize> = None;
-        let mut b = open + 1;
-        while b < n {
-            if mask[b] {
-                if bytes[b] == b'{' {
-                    depth += 1;
-                } else if bytes[b] == b'}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(b);
-                        break;
-                    }
-                }
-            }
-            b += 1;
-        }
-        match close {
-            Some(close) => i = close + 1,
-            None => return result,
-        }
-    }
-
-    result.push_str(&source[i..]);
-    result
-}
-
 /// Like `strip_extern_bodies` but also strips plain `pub fn` bodies, so the
 /// hot module-graph functions count as "body-only" changes too.  Private
 /// helpers (`fn state`, `fn spawn_default_quads`) and `pub(crate)` items keep
@@ -1053,7 +1000,9 @@ fn resolve_symbol_address(library: &Library, name: &str) -> Option<usize> {
     let resolver: Symbol<extern "C" fn(*const std::os::raw::c_char) -> usize> =
         unsafe { library.get(b"project_resolve_symbol").ok()? };
     let c_name = std::ffi::CString::new(name).ok()?;
-    let address = unsafe { resolver(c_name.as_ptr()) };
+    // Calling a function pointer is a safe operation; only obtaining it from
+    // the DLL is unsafe.
+    let address = resolver(c_name.as_ptr());
     if address == 0 {
         None
     } else {
@@ -1687,9 +1636,17 @@ impl ProjectSession {
         // Canonical hot symbols (project_update + the module-graph pub fns).
         let symbols = collect_hot_symbols(&project_sources);
 
-        // Per-function diff against the cache.  Tracked = plumbing exports
-        // (set_api/init/resolve_symbol) + all hot symbols.
-        let mut tracked: Vec<(String, String, String, String)> = extern_funcs.clone();
+        // Per-function diff against the cache.  Tracked = the NON-hot plumbing
+        // exports (set_api/init/resolve_symbol) + all hot symbols.  Hot
+        // symbols like `project_update` are also `pub extern` and would be
+        // picked up by the extern extractor too - filtering them out here
+        // keeps each function listed exactly once.
+        let plumbing_only: Vec<(String, String, String, String)> = extern_funcs
+            .iter()
+            .filter(|entry| !symbols.iter().any(|symbol| symbol.name == entry.0))
+            .cloned()
+            .collect();
+        let mut tracked: Vec<(String, String, String, String)> = plumbing_only.clone();
         for symbol in &symbols {
             tracked.push((
                 symbol.name.clone(),
@@ -1703,7 +1660,7 @@ impl ProjectSession {
             "  {} source file(s), {} hot function(s) + {} plumbing export(s) tracked:",
             paint_bright_cyan(&project_sources.len().to_string()),
             paint_bright_cyan(&symbols.len().to_string()),
-            paint_bright_cyan(&extern_funcs.len().to_string())
+            paint_bright_cyan(&plumbing_only.len().to_string())
         );
         for entry in &tracked {
             let status_text = if self.is_cached(&entry.0, &entry.2) {

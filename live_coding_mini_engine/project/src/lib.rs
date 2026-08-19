@@ -29,6 +29,11 @@ use std::ffi::c_void;
 mod bloat_gen_no_export;
 mod modules;
 
+// Auto-generated hot-symbol registry (build.rs writes it to OUT_DIR): maps
+// every hot function's name to its address, so no function/module ever has
+// to be declared by hand.  `pub(crate)` so it is not itself treated as hot.
+include!(concat!(env!("OUT_DIR"), "/hot_registry.rs"));
+
 /// Mirror of `mini_engine::ProjectApi` - must match field-for-field, in order.
 #[repr(C)]
 struct ProjectApi {
@@ -121,7 +126,8 @@ pub extern "C" fn project_set_api(api: *const ProjectApi) {
 
 /// THE single exported entry point the host uses to resolve any hot
 /// function's address by name (instead of exporting every graph function).
-/// Returns the address, or 0 when the name is unknown.
+/// Returns the address, or 0 when the name is unknown.  The lookup itself
+/// lives in the build.rs-generated `resolve_hot_symbol` registry.
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
 pub extern "C" fn project_resolve_symbol(name: *const std::os::raw::c_char) -> usize {
@@ -132,10 +138,7 @@ pub extern "C" fn project_resolve_symbol(name: *const std::os::raw::c_char) -> u
     let Ok(name) = name.to_str() else {
         return 0;
     };
-    match name {
-        "project_update" => project_update as usize,
-        _ => modules::resolve_hot_symbol(name),
-    }
+    resolve_hot_symbol(name)
 }
 
 /// Borrow the engine-owned game state through the API table.
