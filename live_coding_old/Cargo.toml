@@ -1,0 +1,3 @@
+[workspace]
+members = ["live_patch", "patch_dll"]
+resolver = "3"

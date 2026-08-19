@@ -3,9 +3,18 @@
 A tiny **macroquad-based mini engine** with **Live Coding** hot-reload for the
 game code, in the style of UE Live Coding / Live++:
 
-- **standalone** — the host binary.  Opens the window, statically links the
-  engine, **watches the project source**, rebuilds the project DLL on change,
-  and hot-swaps it into the engine.  The window and engine never restart.
+- **live_coding** — the **reusable Live Coding library**, decoupled from any
+  engine.  It contains the source mini-lexer, hot-symbol collection, change
+  detection, self-contained patch-module generation (real body + forwarding
+  wrappers through a dependency-address table), the `rustc` single-function
+  compile, the Windows prologue-patching primitives and a `LiveCodeSession`
+  that owns the loaded libraries, caches and full-rebuild fallback.  Any host
+  can embed the same machinery by configuring `LiveCodeSessionConfig`
+  (paths, build command, API-table pointer, file→scope mapping) and driving
+  `handle_change` from its own file watcher.
+- **standalone** — the host binary, deliberately thin: it opens the window,
+  creates a `LiveCodeSession` for the mini-engine project layout, **watches
+  the project source**, and hands the session's outcomes to the engine.
 - **engine** (`mini_engine`) — the renderer.  Owns the macroquad window and
   render loop, holds the **engine-owned game state** (the quads), and calls
   the project's `update` function every frame.
@@ -24,6 +33,9 @@ game code, in the style of UE Live Coding / Live++:
 │  │  MiniEngine                   │     │ │  watches project/ + rebuilds
 │  │  state: GameState (quads)     │     │ │  + atomically swaps update fn
 │  │  update_fn ──► project_update │     └─┼─►  project.dll (cdylib)
+│  └───────────────────────────────┘     │ │
+│  ┌───────────────────────────────┐     │ │
+│  │  live_coding::LiveCodeSession │◄────┼─►  change events + prologue patches
 │  └───────────────────────────────┘     │ │
 └──────────────────────────────────────────┘
 ```

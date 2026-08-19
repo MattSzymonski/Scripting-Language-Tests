@@ -1,0 +1,77 @@
+name: live-coding
+
+on:
+  push:
+    paths:
+      - "live_coding/**"
+      - "live_coding_mini_engine/**"
+      - ".github/workflows/live-coding.yml"
+  pull_request:
+    paths:
+      - "live_coding/**"
+      - "live_coding_mini_engine/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crate:
+    name: live_coding crate (unit tests + example)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: live_coding
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            live_coding/target
+          key: ${{ runner.os }}-cargo-live-coding-${{ hashFiles('live_coding/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-live-coding-
+
+      - name: Check formatting and lints
+        run: |
+          cargo build --features watch
+          cargo build --example minimal_host --features watch
+
+      - name: Run unit tests (with watch feature)
+        run: cargo test --features watch
+
+  mini-engine:
+    name: mini-engine end-to-end suite
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            live_coding_mini_engine/target
+          key: ${{ runner.os }}-cargo-mini-engine-${{ hashFiles('live_coding_mini_engine/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-mini-engine-
+
+      - name: Build the mini-engine workspace
+        run: cargo build
+        working-directory: live_coding_mini_engine
+
+      - name: Run the end-to-end live-coding test suite
+        # The suite launches the standalone host (opens a window), so this
+        # job needs an interactive session - it may need a self-hosted runner
+        # in locked-down environments.
+        run: python run_live_coding_tests.py
+        working-directory: live_coding_mini_engine

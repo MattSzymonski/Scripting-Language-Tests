@@ -108,12 +108,6 @@ const QUAD_HALF_SIZE_FACTOR: f32 = 0.5;
 /// The engine's API table, stored when the host calls `project_set_api`.
 static mut API: *const ProjectApi = std::ptr::null();
 
-struct test {
-    internal: i32,
-    external: i32,
-    a: i32,
-}
-
 /// Called by the host right after every load/reload with the engine's API
 /// table.  The engine owns the state; we only get a pointer to it.
 #[unsafe(no_mangle)]
@@ -251,9 +245,7 @@ fn print_verification_checksum() {
     }
 }
 
-fn get_aaa() -> i32 {
-    56
-}
+fn get_aaa() -> i32 { 56 }
 
 fn scale_value_0032(input: i32, factor: i32) -> i32 {
     input * factor * get_aaa() * 8

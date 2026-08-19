@@ -9,36 +9,15 @@
 //! near the original function (holding an absolute `mov rax, imm64; jmp rax`)
 //! and the prologue jumps to that.
 //!
-//! The mini engine patches on the main thread, between frames, so there is no
+//! Patching must happen on the main thread, between frames, so there is no
 //! concurrent executor inside the first 5 bytes of the patched function and
 //! no thread suspension is needed.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-// ---------------------------------------------------------------------------
-// ANSI colour helpers for the patch logs
-// ---------------------------------------------------------------------------
-
-/// Wrap `text` in an ANSI SGR code when stdout is an interactive terminal.
-fn paint(code: &str, text: &str) -> String {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-/// Dim (grey) text - used for the low-level patch details.
-fn dim(text: &str) -> String {
-    paint("2", text)
-}
-
-/// Cyan text - used for addresses and byte dumps.
-fn cyan(text: &str) -> String {
-    paint("36", text)
-}
+use crate::style::{paint_cyan as cyan, paint_dim as dim};
+use crate::error::LiveCodeError;
 
 // ---------------------------------------------------------------------------
 // Memory-protection constants (WinNT.h)
@@ -110,8 +89,12 @@ static TRAMPOLINE_CACHE: LazyLock<Mutex<HashMap<usize, usize>>> =
 /// - `old_address` must point at the start of a real function with at least 5
 ///   patchable prologue bytes, and must not be concurrently executed.
 /// - `new_address` must point at a function with a compatible ABI.
+///
+/// The caller is responsible for the single-threaded patching contract: the
+/// function being patched must not be running on another thread while the
+/// prologue bytes are overwritten.
 #[cfg(windows)]
-pub unsafe fn patch_prologue(old_address: usize, new_address: usize) -> Result<(), String> {
+pub unsafe fn patch_prologue(old_address: usize, new_address: usize) -> crate::error::Result<()> {
     // The jump destination is old_address + 5 (after the rel32 instruction).
     let jump_source: i64 = old_address as i64 + JMP_REL32_SIZE as i64;
     let relative: i64 = new_address as i64 - jump_source;
@@ -143,7 +126,10 @@ pub unsafe fn patch_prologue(old_address: usize, new_address: usize) -> Result<(
     let trampoline_address = build_trampoline(old_address, new_address)?;
     let trampoline_relative = trampoline_address as i64 - jump_source;
     if trampoline_relative < i32::MIN as i64 || trampoline_relative > i32::MAX as i64 {
-        return Err("trampoline still out of rel32 range".to_string());
+        return Err(LiveCodeError::PatchFailed {
+            address: old_address,
+            message: "trampoline still out of rel32 range".to_string(),
+        });
     }
     println!(
         "      {} {}",
@@ -154,18 +140,28 @@ pub unsafe fn patch_prologue(old_address: usize, new_address: usize) -> Result<(
 }
 
 #[cfg(not(windows))]
-pub unsafe fn patch_prologue(_old_address: usize, _new_address: usize) -> Result<(), String> {
-    Err("prologue patching is only supported on Windows x86/x64".to_string())
+pub unsafe fn patch_prologue(_old_address: usize, _new_address: usize) -> crate::error::Result<()> {
+    Err(LiveCodeError::PatchFailed {
+        address: _old_address,
+        message: "prologue patching is only supported on Windows x86/x64".to_string(),
+    })
 }
 
 /// Write a 5-byte `jmp rel32` at `function_address` targeting
 /// `function_address + 5 + relative`.
+///
+/// # Safety
+///
+/// `function_address` must be the start of a writable-after-`VirtualProtect`
+/// code page and must not be concurrently executed.
 #[cfg(windows)]
-unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> Result<(), String> {
+unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> crate::error::Result<()> {
     let function_start = function_address as *mut u8;
 
     // Make the code page writable, remembering the previous protection.
     let mut old_protection: u32 = 0;
+    // SAFETY: function_start points at real executable code; VirtualProtect
+    // only touches the page protection, never the contents.
     let protect_result = unsafe {
         VirtualProtect(
             function_start as *mut std::ffi::c_void,
@@ -175,13 +171,17 @@ unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> Result<(), 
         )
     };
     if protect_result == 0 {
-        return Err(format!(
-            "VirtualProtect failed at {function_address:#x}: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(LiveCodeError::PatchFailed {
+            address: function_address,
+            message: format!(
+                "VirtualProtect failed: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
     }
 
     // Write the jmp rel32: E9 <little-endian rel32>.
+    // SAFETY: the page is now writable; we write exactly the 5 prologue bytes.
     unsafe {
         *function_start = JMP_REL32_OPCODE;
         let rel_bytes = relative.to_le_bytes();
@@ -201,6 +201,8 @@ unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> Result<(), 
     );
 
     // Flush the instruction cache so the CPU executes the new bytes.
+    // SAFETY: the patched page contains the new bytes; flushing is required
+    // before execution on x86.
     unsafe {
         FlushInstructionCache(
             GetCurrentProcess(),
@@ -211,6 +213,7 @@ unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> Result<(), 
 
     // Restore the previous page protection.
     let mut ignored_protection: u32 = 0;
+    // SAFETY: restoring protection on the same page we made writable above.
     unsafe {
         VirtualProtect(
             function_start as *mut std::ffi::c_void,
@@ -225,8 +228,13 @@ unsafe fn write_jmp_rel32(function_address: usize, relative: i32) -> Result<(), 
 
 /// Allocate a trampoline near `old_address` holding `mov rax, imm64; jmp rax`
 /// to `new_address`, searching ±1 GB for free memory in 16 KB strides.
+///
+/// # Safety
+///
+/// `old_address` must be a valid code address; the returned allocation is
+/// executable scratch memory.
 #[cfg(windows)]
-unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usize, String> {
+unsafe fn build_trampoline(old_address: usize, new_address: usize) -> crate::error::Result<usize> {
     // Reuse a cached trampoline for this target if it is reachable.
     if let Some(existing) = TRAMPOLINE_CACHE.lock().unwrap().get(&new_address).copied() {
         let existing_relative = existing as i64 - (old_address as i64 + JMP_REL32_SIZE as i64);
@@ -254,6 +262,8 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
         };
 
         if candidate >= low_bound && (candidate as i64) <= high_bound && candidate != 0 {
+            // SAFETY: VirtualAlloc reserves executable scratch memory at a
+            // candidate address; a null return means failure (handled below).
             let allocation = unsafe {
                 VirtualAlloc(
                     candidate as *mut std::ffi::c_void,
@@ -264,6 +274,8 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
             };
             if !allocation.is_null() {
                 let trampoline_start = allocation as *mut u8;
+                // SAFETY: the freshly allocated page is writable; we write the
+                // full 12-byte trampoline before it is ever executed.
                 unsafe {
                     // mov rax, imm64
                     *trampoline_start = REX_W_PREFIX;
@@ -278,6 +290,7 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
                     *trampoline_start.add(11) = JMP_RAX_MODRM;
                 }
                 // Flush the instruction cache for the trampoline.
+                // SAFETY: the trampoline is executable scratch we just wrote.
                 unsafe {
                     FlushInstructionCache(GetCurrentProcess(), allocation, TRAMPOLINE_SIZE);
                 }
@@ -308,9 +321,10 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
         }
     }
 
-    Err(format!(
-        "could not allocate a trampoline near {old_address:#x}"
-    ))
+    Err(LiveCodeError::PatchFailed {
+        address: old_address,
+        message: "could not allocate a trampoline".to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -318,16 +332,21 @@ unsafe fn build_trampoline(old_address: usize, new_address: usize) -> Result<usi
 // ---------------------------------------------------------------------------
 
 /// Write `source_code` to a fixed temp `.rs` and compile it to a cdylib with
-/// `rustc` directly (bypassing cargo).  Returns the compiled DLL path.
+/// `rustc` directly (bypassing cargo).  Returns the compiled library path.
 ///
 /// The SOURCE path and the incremental cache directory are fixed per crate
 /// name, so repeated leaf compiles reuse rustc's incremental state (only the
-/// changed body gets re-codegened).  The output DLL stays unique per compile,
-/// because a previously loaded patch DLL locks its file on Windows.
+/// changed body gets re-codegened).  The output library stays unique per
+/// compile, because a previously loaded patch DLL locks its file on Windows.
+///
+/// `edition` selects the Rust edition (e.g. "2021") and `artifact_extension`
+/// the shared-library suffix ("dll", "so", "dylib").
 pub fn compile_rust_source(
     source_code: &str,
     crate_name: &str,
-) -> Result<std::path::PathBuf, String> {
+    edition: &str,
+    artifact_extension: &str,
+) -> crate::error::Result<std::path::PathBuf> {
     use std::io::Write;
 
     let temp_dir = std::env::temp_dir();
@@ -340,30 +359,41 @@ pub fn compile_rust_source(
     // rustc's incremental cache is reused across compiles.
     let source_path = temp_dir.join(format!("{crate_name}_leaf.rs"));
     let incremental_dir = temp_dir.join(format!("{crate_name}_leaf_incr"));
-    let dll_path = temp_dir.join(format!("{crate_name}_{pid}_{counter}.dll"));
+    let lib_path = temp_dir.join(format!(
+        "{crate_name}_{pid}_{counter}.{artifact_extension}"
+    ));
 
-    let mut file = std::fs::File::create(&source_path)
-        .map_err(|e| format!("cannot create {source_path:?}: {e}"))?;
-    file.write_all(source_code.as_bytes())
-        .map_err(|e| format!("cannot write {source_path:?}: {e}"))?;
+    let mut file = std::fs::File::create(&source_path).map_err(|source| LiveCodeError::SourceIo {
+        path: source_path.clone(),
+        source,
+    })?;
+    file.write_all(source_code.as_bytes()).map_err(|source| LiveCodeError::SourceIo {
+        path: source_path.clone(),
+        source,
+    })?;
     drop(file);
 
     let output = std::process::Command::new("rustc")
         .args(["--crate-type=cdylib", "--crate-name"])
         .arg(crate_name)
-        .args(["--edition", "2021", "-o"])
-        .arg(&dll_path)
+        .args(["--edition", edition, "-o"])
+        .arg(&lib_path)
         .args(["-C", &format!("incremental={}", incremental_dir.display())])
         .arg(&source_path)
         .output()
-        .map_err(|e| format!("failed to run rustc: {e}"))?;
+        .map_err(|source| LiveCodeError::SourceIo {
+            path: source_path.clone(),
+            source,
+        })?;
 
     let _ = std::fs::remove_file(&source_path);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("rustc failed:\n{stderr}"));
+        return Err(LiveCodeError::RustcFailed {
+            stderr: stderr.to_string(),
+        });
     }
 
-    Ok(dll_path)
+    Ok(lib_path)
 }

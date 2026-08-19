@@ -1,3 +1,22 @@
-[workspace]
-members = ["live_patch", "patch_dll"]
-resolver = "3"
+[package]
+name = "live_coding"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable Live Coding for Rust cdylib projects: watch sources, recompile changed functions via rustc and patch their prologues in place (Live++/UE-style), with a full-rebuild fallback."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+libloading = "0.8"
+notify = { version = "6", optional = true }
+
+[features]
+default = []
+# Bundle a file watcher so consumers get the whole loop out of the box via
+# `LiveCodeSession::watch` instead of wiring up `notify` themselves.
+watch = ["dep:notify"]
+
+[[example]]
+name = "minimal_host"
+required-features = ["watch"]

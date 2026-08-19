@@ -2,10 +2,10 @@
 name = "standalone"
 version = "0.1.0"
 edition = "2021"
-description = "Mini-engine host: window + engine, watches the project crate and hot-swaps it"
+description = "Mini-engine host: window + engine, watches the project crate and hot-swaps it via the live_coding crate"
 
 [dependencies]
 mini_engine = { path = "../engine" }
+live_coding = { path = "../../live_coding" }
 macroquad = "0.4"
-libloading = "0.8"
 notify = "6"

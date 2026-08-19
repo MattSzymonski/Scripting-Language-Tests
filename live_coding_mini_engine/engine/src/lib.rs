@@ -18,7 +18,6 @@
 
 mod api;
 mod engine;
-pub mod patch;
 mod state;
 
 pub use api::ProjectApi;
