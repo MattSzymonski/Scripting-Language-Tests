@@ -626,6 +626,7 @@ impl LiveCodeSession {
         );
         let module_names = crate::module::PatchModuleNames {
             resolver: &self.config.contract.resolve_symbol,
+            set_api: &self.config.contract.set_api,
             set_dependencies: &self.config.contract.set_dependencies,
         };
         let module_source = crate::module::build_patch_module_source(

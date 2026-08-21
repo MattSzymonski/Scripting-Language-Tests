@@ -250,7 +250,7 @@ fn get_aaa() -> i32 {
 }
 
 fn scale_value_0032(input: i32, factor: i32) -> i32 {
-    input * factor * get_aaa() * 45
+    input * factor * get_aaa() * 35
 }
 
 /// The engine calls this every frame.  Animate the engine-owned quads so they

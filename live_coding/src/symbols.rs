@@ -13,6 +13,7 @@ use crate::analysis;
 
 /// A single hot-reloadable function, with the module scope it lives in (so
 /// the patch module can rebuild the same call-graph shape as stubs).
+#[derive(Clone)]
 pub struct HotSymbol {
     /// Bare function name (may collide across scopes - the key is the path).
     pub name: String,
