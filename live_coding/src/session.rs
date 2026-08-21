@@ -156,10 +156,24 @@ impl LiveCodeSessionConfig {
             contract: LiveCodingContract::default(),
             api_pointer,
             file_scope: crate::symbols::default_file_scope,
-            infra_names: crate::symbols::DEFAULT_INFRA_NAMES
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
+            // The mini-engine's project-specific infrastructure blocklist:
+            // plumbing exports, the generated registry helper, the state
+            // accessor and the verification tooling.  (The plumbing names are
+            // also unioned from the contract in `LiveCodeSession::new`.)
+            infra_names: [
+                "project_set_api",
+                "project_init",
+                "project_resolve_symbol",
+                "project_set_dependencies",
+                "resolve_hot_symbol",
+                "state",
+                "spawn_default_quads",
+                "verification_checksum",
+                "print_verification_checksum",
+            ]
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
             rustc_edition: "2021".to_string(),
             artifact_extension: "dll".to_string(),
             keep_versioned_libraries: 8,
@@ -265,7 +279,15 @@ impl LiveCodeSession {
     /// Create a session, validating the configuration.
     pub fn new(config: LiveCodeSessionConfig) -> Result<Self> {
         config.validate()?;
-        let infra_names = config.infra_names.iter().cloned().collect();
+        // The contract's plumbing exports are never hot - union them with the
+        // config's project-specific infrastructure names (state accessor,
+        // verification helpers, ...).  The update entry point is deliberately
+        // NOT added: it is a hot function.
+        let mut infra_names: HashSet<String> = config.infra_names.iter().cloned().collect();
+        infra_names.insert(config.contract.set_api.clone());
+        infra_names.insert(config.contract.init.clone());
+        infra_names.insert(config.contract.resolve_symbol.clone());
+        infra_names.insert(config.contract.set_dependencies.clone());
         Ok(Self {
             config,
             infra_names,
@@ -306,7 +328,11 @@ impl LiveCodeSession {
     }
 
     fn upsert_cached(&mut self, entry: (String, String, String, String)) {
-        if let Some(slot) = self.cached_funcs.iter_mut().find(|cached| cached.0 == entry.0) {
+        if let Some(slot) = self
+            .cached_funcs
+            .iter_mut()
+            .find(|cached| cached.0 == entry.0)
+        {
             *slot = entry;
         } else {
             self.cached_funcs.push(entry);
@@ -387,7 +413,12 @@ impl LiveCodeSession {
         let stem = lib_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "project".to_string());
+            .unwrap_or_else(|| {
+                lib_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "lib".to_string())
+            });
         let versioned = versioned_lib_path(
             lib_path.parent().unwrap(),
             &stem,
@@ -401,12 +432,11 @@ impl LiveCodeSession {
 
         // SAFETY: Library::new maps the freshly copied DLL; the returned
         // handle is the only way to reach its symbols afterwards.
-        let library = unsafe { Library::new(&versioned) }.map_err(|message| {
-            LiveCodeError::LoadFailed {
+        let library =
+            unsafe { Library::new(&versioned) }.map_err(|message| LiveCodeError::LoadFailed {
                 path: versioned.clone(),
                 message: message.to_string(),
-            }
-        })?;
+            })?;
 
         // Hand the API table to the DLL, run its init, and copy out the
         // update address.  The Symbols borrow `library`, so they must be
@@ -425,8 +455,8 @@ impl LiveCodeSession {
             let init: Symbol<extern "C" fn()> = library
                 .get(self.config.contract.init.as_bytes())
                 .map_err(|_| LiveCodeError::SymbolMissing {
-                    name: self.config.contract.init.clone(),
-                })?;
+                name: self.config.contract.init.clone(),
+            })?;
             init();
 
             let update: Symbol<crate::ProjectUpdateFn> = library
@@ -443,9 +473,18 @@ impl LiveCodeSession {
     /// Initial build + load; returns the update address the consumer should
     /// point its engine at.
     pub fn load_initial(&mut self) -> Result<usize> {
+        let dll_name = self
+            .config
+            .dll_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project.dll".to_string());
         self.emit(
             LogLevel::Normal,
-            &format!("\n  {}\n", paint_bright_cyan("▸ Building project.dll (cold)...")),
+            &format!(
+                "\n  {}\n",
+                paint_bright_cyan(&format!("▸ Building {dll_name} (cold)..."))
+            ),
         );
         let build_start = Instant::now();
         let (library, update_address) = self.build_and_load_full()?;
@@ -497,10 +536,7 @@ impl LiveCodeSession {
             .collect();
         let stripped = project_sources
             .iter()
-            .map(|(path, content)| {
-                self.source_cache
-                    .stripped(path, content, &root_hot_names)
-            })
+            .map(|(path, content)| self.source_cache.stripped(path, content, &root_hot_names))
             .collect::<Vec<_>>()
             .join("\n");
         self.stripped_source = stripped;
@@ -534,7 +570,7 @@ impl LiveCodeSession {
                 "{} {}\n",
                 hot_prefix(),
                 paint_bright_green(&format!(
-                    "base project.dll loaded - jumping quads are live ({} @ {})",
+                    "base {dll_name} loaded - jumping quads are live ({} @ {})",
                     self.config.contract.update,
                     paint_cyan(&format!("{update_address:#x}"))
                 ))
@@ -588,8 +624,16 @@ impl LiveCodeSession {
             self.config.file_scope,
             &mut self.source_cache,
         );
-        let module_source =
-            crate::module::build_patch_module_source(lib_source, &symbols, &symbol_path(changed));
+        let module_names = crate::module::PatchModuleNames {
+            resolver: &self.config.contract.resolve_symbol,
+            set_dependencies: &self.config.contract.set_dependencies,
+        };
+        let module_source = crate::module::build_patch_module_source(
+            lib_source,
+            &symbols,
+            &symbol_path(changed),
+            &module_names,
+        );
         let compile_start = Instant::now();
         self.emit(
             LogLevel::Normal,
@@ -611,12 +655,11 @@ impl LiveCodeSession {
         );
 
         // SAFETY: Library::new maps the freshly compiled patch DLL.
-        let library = unsafe { Library::new(&lib_path) }.map_err(|message| {
-            LiveCodeError::LoadFailed {
+        let library =
+            unsafe { Library::new(&lib_path) }.map_err(|message| LiveCodeError::LoadFailed {
                 path: lib_path.clone(),
                 message: message.to_string(),
-            }
-        })?;
+            })?;
 
         // SAFETY: the patch module exports plain extern "C" entry points with
         // the expected signatures; the API pointer and dependency table are
@@ -715,7 +758,7 @@ impl LiveCodeSession {
         let build_start = Instant::now();
         self.emit(
             LogLevel::Normal,
-            &format!("    cargo build -p project --target-dir target_reload ...\n"),
+            &format!("    cargo {} ...\n", self.config.build_args.join(" ")),
         );
         let (library, update_address) = self.build_and_load_full()?;
 
@@ -878,10 +921,7 @@ impl LiveCodeSession {
             .collect();
         let stripped = project_sources
             .iter()
-            .map(|(path, content)| {
-                self.source_cache
-                    .stripped(path, content, &root_hot_names)
-            })
+            .map(|(path, content)| self.source_cache.stripped(path, content, &root_hot_names))
             .collect::<Vec<_>>()
             .join("\n");
         let stripped_changed = stripped != self.stripped_source;
@@ -962,7 +1002,11 @@ impl LiveCodeSession {
                 ),
             );
         }
-        let non_body_text = if stripped_changed { "CHANGED" } else { "unchanged" };
+        let non_body_text = if stripped_changed {
+            "CHANGED"
+        } else {
+            "unchanged"
+        };
         self.emit(
             LogLevel::Normal,
             &format!(
@@ -1002,7 +1046,8 @@ impl LiveCodeSession {
 
         // Anything below forces a full rebuild:
         //  - non-body content (consts / structs / attrs / module decls / bloat)
-        //  - plumbing functions (set_api / init / resolver)
+        //  - plumbing functions (set_api / init / resolver, whatever the
+        //    contract names them)
         //  - the hot function set changed shape (new/removed module functions)
         let plumbing_changed = extern_funcs.iter().any(|entry| {
             (entry.0 == self.config.contract.set_api
@@ -1035,16 +1080,19 @@ impl LiveCodeSession {
         } else {
             let mut reasons = Vec::new();
             if changed_symbols.is_empty() {
-                reasons.push("no hot function body changed");
+                reasons.push("no hot function body changed".to_string());
             }
             if stripped_changed {
-                reasons.push("non-body content changed (structs/consts/static/bloat)");
+                reasons.push("non-body content changed (structs/consts/static/bloat)".to_string());
             }
             if plumbing_changed {
-                reasons.push("plumbing function changed (project_set_api / project_init)");
+                reasons.push(format!(
+                    "plumbing function changed ({} / {})",
+                    self.config.contract.set_api, self.config.contract.init
+                ));
             }
             if structure_changed {
-                reasons.push("hot function set changed shape (new/removed)");
+                reasons.push("hot function set changed shape (new/removed)".to_string());
             }
             let reasons = if reasons.is_empty() {
                 "no actionable change".to_string()
@@ -1148,8 +1196,8 @@ impl LiveCodeSession {
     where
         F: FnMut(ChangeOutcome),
     {
-        use std::time::Duration;
         use notify::{Config, RecursiveMode, Watcher};
+        use std::time::Duration;
 
         let (change_tx, change_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
         let watch_dir = self.config.project_dir.clone();
@@ -1161,9 +1209,7 @@ impl LiveCodeSession {
                         .iter()
                         .filter(|path| {
                             path.extension().map_or(false, |ext| ext == "rs")
-                                || path
-                                    .file_name()
-                                    .map_or(false, |name| name == "Cargo.toml")
+                                || path.file_name().map_or(false, |name| name == "Cargo.toml")
                         })
                         .cloned()
                         .collect();
@@ -1180,10 +1226,7 @@ impl LiveCodeSession {
         watcher
             .watch(&watch_dir, RecursiveMode::Recursive)
             .map_err(|e| {
-                LiveCodeError::InvalidConfig(format!(
-                    "cannot watch {}: {e}",
-                    watch_dir.display()
-                ))
+                LiveCodeError::InvalidConfig(format!("cannot watch {}: {e}", watch_dir.display()))
             })?;
 
         self.emit(
@@ -1197,9 +1240,9 @@ impl LiveCodeSession {
 
         loop {
             // Block until the next change event arrives.
-            let changed_paths = change_rx
-                .recv()
-                .map_err(|e| LiveCodeError::InvalidConfig(format!("watcher channel closed: {e}")))?;
+            let changed_paths = change_rx.recv().map_err(|e| {
+                LiveCodeError::InvalidConfig(format!("watcher channel closed: {e}"))
+            })?;
             // Let the editor finish writing before reading the file.
             std::thread::sleep(Duration::from_millis(150));
             // Merge any extra events from the same save burst.

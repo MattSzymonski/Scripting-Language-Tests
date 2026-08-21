@@ -32,16 +32,17 @@
 //! # Modules
 //!
 //! - [`analysis`] - a mini-lexer that extracts function bodies, private
-//!   helpers, top-level consts/types and strips hot bodies for change
-//!   detection.
+//!   helpers, top-level consts/types/statics/imports/extern exports and
+//!   strips hot bodies for change detection.
 //! - [`symbols`] - the hot-symbol model (`HotSymbol`), source-file to
 //!   module-scope mapping, qualified-path keys and the incremental
 //!   [`symbols::SourceCache`].
 //! - [`error`] - the unified [`error::LiveCodeError`] type.
 //! - [`patch`] - the raw prologue-patching primitives plus `rustc`
 //!   single-function compilation.
-//! - [`module`] - generates the self-contained patch module source (real
-//!   body + forwarding wrappers through a dependency-address table).
+//! - [`module`] - generates the self-contained patch module source from the
+//!   project's OWN definitions (real body + forwarding wrappers through a
+//!   dependency-address table).
 //! - [`session`] - [`LiveCodeSession`]: owns the loaded libraries, caches,
 //!   change detection, per-function patching and full-reload fallback.
 //!

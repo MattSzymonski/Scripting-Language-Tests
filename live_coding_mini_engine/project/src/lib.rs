@@ -182,7 +182,7 @@ fn spawn_default_quads(game_state: &mut GameState, screen_width: f32, screen_hei
         quad.y = quad.base_y;
         quad.vx = QUAD_INITIAL_VELOCITY_X + index as f32 * QUAD_VELOCITY_X_STEP;
         quad.jump_speed = QUAD_INITIAL_JUMP_SPEED + index as f32 * QUAD_JUMP_SPEED_STEP;
-        quad.jump_height = QUAD_INITIAL_JUMP_HEIGHT + index as f32 * QUAD_JUMP_HEIGHT_STEP;
+        quad.jump_height = QUAD_INITIAL_JUMP_HEIGHT + index as f32 * QUAD_JUMP_HEIGHT_STEP * 4.0;
         quad.color = QUAD_COLOURS[index];
     }
     game_state.quad_count = count;
@@ -250,7 +250,7 @@ fn get_aaa() -> i32 {
 }
 
 fn scale_value_0032(input: i32, factor: i32) -> i32 {
-    input * factor * get_aaa() * 8
+    input * factor * get_aaa() * 45
 }
 
 /// The engine calls this every frame.  Animate the engine-owned quads so they
@@ -282,7 +282,7 @@ pub extern "C" fn project_update(delta_time: f32) {
         quad.x += quad.vx * delta_time;
         if quad.x < half_width || quad.x > screen_width - half_width {
             quad.vx = -quad.vx;
-            quad.x = quad.x.clamp(half_width, screen_width - half_width - 2.0);
+            quad.x = quad.x.clamp(half_width, screen_width - half_width - 1.0);
         }
 
         // Jump: y oscillates between base_y and base_y - jump_height, scaled

@@ -30,19 +30,16 @@ pub struct HotSymbol {
     pub index: usize,
 }
 
-/// Function names that are never hot (plumbing exports and infrastructure
-/// helpers).  The project's `build.rs` keeps the same blocklist so the
-/// generated registry agrees with the host's symbol collection.
-pub const DEFAULT_INFRA_NAMES: &[&str] = &[
-    "project_set_api",
-    "project_init",
-    "project_resolve_symbol",
-    "resolve_hot_symbol",
-    "state",
-    "spawn_default_quads",
-    "verification_checksum",
-    "print_verification_checksum",
-];
+/// Function names that are never hot regardless of the project.  This is
+/// deliberately tiny: the plumbing exports themselves (`project_set_api` &
+/// co.) are excluded via the [`crate::session::LiveCodingContract`] at
+/// session build time, and project-specific infrastructure helpers (e.g. the
+/// mini-engine's `state` / `spawn_default_quads`) belong in
+/// [`crate::session::LiveCodeSessionConfig::infra_names`] instead.  The one
+/// entry here, `resolve_hot_symbol`, is the registry helper the crate's
+/// resolver pattern generates (kept defensively - it never appears in
+/// scanned sources).
+pub const DEFAULT_INFRA_NAMES: &[&str] = &["resolve_hot_symbol"];
 
 /// Default source-file -> Rust-scope mapping (the mini-engine layout):
 /// `lib.rs` is the crate root ("top"), `modules.rs` is "modules", and
@@ -136,9 +133,9 @@ impl SourceCache {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().map_or(false, |ext| ext == "rs") {
-                    self.contents.entry(path.clone()).or_insert_with(|| {
-                        std::fs::read_to_string(&path).unwrap_or_default()
-                    });
+                    self.contents
+                        .entry(path.clone())
+                        .or_insert_with(|| std::fs::read_to_string(&path).unwrap_or_default());
                 }
             }
         }
@@ -327,12 +324,31 @@ mod tests {
     }
 
     fn infra() -> HashSet<String> {
-        DEFAULT_INFRA_NAMES.iter().map(|s| s.to_string()).collect()
+        DEFAULT_INFRA_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .chain(
+                [
+                    "project_set_api",
+                    "project_init",
+                    "project_resolve_symbol",
+                    "state",
+                    "spawn_default_quads",
+                    "verification_checksum",
+                    "print_verification_checksum",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
+            )
+            .collect()
     }
 
     #[test]
     fn default_file_scope_maps_mini_engine_layout() {
-        assert_eq!(default_file_scope(Path::new("lib.rs")).as_deref(), Some("top"));
+        assert_eq!(
+            default_file_scope(Path::new("lib.rs")).as_deref(),
+            Some("top")
+        );
         assert_eq!(
             default_file_scope(Path::new("modules.rs")).as_deref(),
             Some("modules")
@@ -358,10 +374,7 @@ mod tests {
                  fn scale_value_003() -> i32 { 4 }\n\
                  fn state() {}\n",
             ),
-            (
-                "modules.rs",
-                "pub fn run_update() -> i32 { 1 }\n",
-            ),
+            ("modules.rs", "pub fn run_update() -> i32 { 1 }\n"),
             (
                 "module_003.rs",
                 "pub fn scale_value_003() -> i32 { 2 }\n\
@@ -384,10 +397,7 @@ mod tests {
     fn symbol_path_is_qualified_per_scope() {
         let project_sources = sources(&[
             ("lib.rs", "fn get_aaa() -> i32 { 3 }\n"),
-            (
-                "module_003.rs",
-                "pub fn scale_value_003() -> i32 { 2 }\n",
-            ),
+            ("module_003.rs", "pub fn scale_value_003() -> i32 { 2 }\n"),
         ]);
         let symbols = collect_hot_symbols(&project_sources, &infra(), default_file_scope);
         let paths: Vec<String> = symbols.iter().map(symbol_path).collect();
@@ -399,18 +409,10 @@ mod tests {
     fn source_cache_reuses_unchanged_extraction() {
         let project_sources = sources(&[("lib.rs", "fn get_aaa() -> i32 { 3 }\n")]);
         let mut cache = SourceCache::new();
-        let first = collect_hot_symbols_cached(
-            &project_sources,
-            &infra(),
-            default_file_scope,
-            &mut cache,
-        );
-        let second = collect_hot_symbols_cached(
-            &project_sources,
-            &infra(),
-            default_file_scope,
-            &mut cache,
-        );
+        let first =
+            collect_hot_symbols_cached(&project_sources, &infra(), default_file_scope, &mut cache);
+        let second =
+            collect_hot_symbols_cached(&project_sources, &infra(), default_file_scope, &mut cache);
         assert_eq!(first.len(), second.len());
         assert_eq!(first[0].name, second[0].name);
         // Unchanged content must hit the cache (same result, no re-parse cost).

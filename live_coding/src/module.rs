@@ -9,7 +9,8 @@
 //! patched to this module.
 
 use crate::analysis::{
-    extract_top_level_consts, extract_top_level_functions, extract_top_level_type_definitions,
+    extract_extern_function_definitions, extract_top_level_consts, extract_top_level_functions,
+    extract_top_level_imports, extract_top_level_statics, extract_top_level_type_definitions,
 };
 use crate::symbols::{parse_params, symbol_path, HotSymbol};
 
@@ -105,22 +106,55 @@ pub fn build_modules_skeleton(symbols: &[HotSymbol], changed_key: &str) -> Strin
     block
 }
 
-/// Build the self-contained module for one changed hot function: lib.rs
-/// consts/types/helpers + ABI mirrors + state() + project_set_api, a
-/// dependency-address table (filled by the host at load) and forwarding
-/// wrappers for every OTHER hot function, so the changed function's call
-/// sites (unchanged text) resolve to stubs that jump back into the base DLL.
-/// This is what makes patching a function "in the middle" of the call graph
-/// take effect: the base prologue of the changed function is patched to this
-/// module, and its calls hit the base (whose own prologues can be patched
-/// later too - patches compose).
+/// The exported entry-point names the generated patch module must provide
+/// (filled from the consumer's [`crate::session::LiveCodingContract`] at call
+/// time).  The module always exports a dependency-table setter and a
+/// hot-symbol resolver; its `set_api` comes from the project's own definition
+/// (injected verbatim).
+pub struct PatchModuleNames<'a> {
+    /// The resolver export name (e.g. `project_resolve_symbol`).
+    pub resolver: &'a str,
+    /// The dependency-table export name (e.g. `project_set_dependencies`).
+    pub set_dependencies: &'a str,
+}
+
+/// Build the self-contained module for one changed hot function: the
+/// project's OWN lib.rs imports/consts/types/statics/helpers/plumbing exports
+/// (injected verbatim, so the module is a faithful copy of the project's
+/// layout), a dependency-address table (filled by the host at load) and
+/// forwarding wrappers for every OTHER hot function, so the changed
+/// function's call sites (unchanged text) resolve to stubs that jump back
+/// into the base DLL.  This is what makes patching a function "in the middle"
+/// of the call graph take effect: the base prologue of the changed function
+/// is patched to this module, and its calls hit the base (whose own
+/// prologues can be patched later too - patches compose).
 pub fn build_patch_module_source(
     lib_source: &str,
     symbols: &[HotSymbol],
     changed_key: &str,
+    names: &PatchModuleNames,
 ) -> String {
+    let imports = extract_top_level_imports(lib_source).join("\n");
     let consts = extract_top_level_consts(lib_source).join("\n");
     let type_definitions = extract_top_level_type_definitions(lib_source).join("\n");
+    let statics = extract_top_level_statics(lib_source).join("\n");
+    // The project's own non-hot extern exports (plumbing), e.g. its
+    // `project_set_api` - injected verbatim (attributes + body) so the patch
+    // module's set_api matches the project's actual signature and type names.
+    // The resolver is excluded (the module generates its own below) and hot
+    // exports (e.g. `project_update`) are emitted as wrappers/real bodies in
+    // `top_definitions` instead.
+    let plumbing_externs = extract_extern_function_definitions(lib_source)
+        .into_iter()
+        .filter(|(name, _)| {
+            name != names.resolver
+                && !symbols
+                    .iter()
+                    .any(|symbol| symbol.scope == "top" && symbol.name == *name)
+        })
+        .map(|(_, definition)| definition)
+        .collect::<Vec<_>>()
+        .join("\n");
     // Inject non-hot lib helpers only - hot helpers (get_aaa, scale_value_003,
     // project_update) are emitted as wrappers/real-bodies in `top_definitions`
     // instead, so injecting them again here would be a duplicate definition.
@@ -171,7 +205,7 @@ pub fn build_patch_module_source(
         .collect::<Vec<_>>()
         .join("\n");
     let resolver = format!(
-        "#[unsafe(no_mangle)]\npub extern \"C\" fn project_resolve_symbol(name: *const std::os::raw::c_char) -> usize {{\n\
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn {}(name: *const std::os::raw::c_char) -> usize {{\n\
          \x20   if name.is_null() {{\n\
          \x20       return 0;\n\
          \x20   }}\n\
@@ -181,71 +215,30 @@ pub fn build_patch_module_source(
          {resolver_arms}\n\
          \x20       _ => 0,\n\
          \x20   }}\n\
-         }}\n"
+         }}\n",
+        names.resolver
     );
 
     format!(
         "#![allow(dead_code)]\n\
-         use std::ffi::c_void;\n\
+         \n\
+         {imports}\n\
          \n\
          {consts}\n\
          \n\
          {type_definitions}\n\
          \n\
+         {statics}\n\
+         \n\
+         {plumbing_externs}\n\
+         \n\
          {helper_functions}\n\
-         \n\
-         #[repr(C)]\n\
-         struct ProjectApi {{\n\
-             get_state: extern \"C\" fn() -> *mut std::ffi::c_void,\n\
-             screen_width: extern \"C\" fn() -> f32,\n\
-             screen_height: extern \"C\" fn() -> f32,\n\
-         }}\n\
-         \n\
-         #[repr(C)]\n\
-         struct Quad {{\n\
-             x: f32,\n\
-             y: f32,\n\
-             base_y: f32,\n\
-             w: f32,\n\
-             h: f32,\n\
-             vx: f32,\n\
-             jump_phase: f32,\n\
-             jump_speed: f32,\n\
-             jump_height: f32,\n\
-             color: u32,\n\
-         }}\n\
-         \n\
-         const MAX_QUADS: usize = 8;\n\
-         \n\
-         #[repr(C)]\n\
-         struct GameState {{\n\
-             tick: f32,\n\
-             quad_count: usize,\n\
-             quads: [Quad; MAX_QUADS],\n\
-         }}\n\
-         \n\
-         static mut API: *const ProjectApi = std::ptr::null();\n\
-         \n\
-         #[no_mangle]\n\
-         #[allow(private_interfaces)]\n\
-         pub extern \"C\" fn project_set_api(api: *const ProjectApi) {{\n\
-             unsafe {{ API = api; }}\n\
-         }}\n\
-         \n\
-         fn state() -> &'static mut GameState {{\n\
-             unsafe {{\n\
-                 let api = API;\n\
-                 assert!(!api.is_null(), \"project_set_api must be called before update\");\n\
-                 let state_pointer = ((*api).get_state)() as *mut GameState;\n\
-                 &mut *state_pointer\n\
-             }}\n\
-         }}\n\
          \n\
          static mut DEPENDENCY_ADDRESSES: *const usize = std::ptr::null();\n\
          \n\
          #[no_mangle]\n\
          #[allow(private_interfaces)]\n\
-         pub extern \"C\" fn project_set_dependencies(addresses: *const usize) {{\n\
+         pub extern \"C\" fn {}(addresses: *const usize) {{\n\
              unsafe {{ DEPENDENCY_ADDRESSES = addresses; }}\n\
          }}\n\
          \n\
@@ -257,7 +250,8 @@ pub fn build_patch_module_source(
          \n\
          {modules_skeleton}\n\
          \n\
-         {resolver}\n"
+         {resolver}\n",
+        names.set_dependencies
     )
 }
 
@@ -350,16 +344,63 @@ mod tests {
 
     #[test]
     fn patch_module_source_has_contract_and_resolver() {
-        let lib_source = "const QUAD_SIZE: f32 = 46.0;\n\nfn get_aaa() -> i32 { 3 }\n";
+        let lib_source = r#"
+            use std::ffi::c_void;
+            #[repr(C)]
+            struct ProjectApi {
+                get_state: extern "C" fn() -> *mut c_void,
+            }
+            const QUAD_SIZE: f32 = 46.0;
+            static mut API: *const ProjectApi = std::ptr::null();
+            #[unsafe(no_mangle)]
+            #[allow(private_interfaces)]
+            pub extern "C" fn project_set_api(api: *const ProjectApi) {
+                unsafe { API = api; }
+            }
+            fn state() -> &'static mut ProjectApi {
+                unsafe { &mut *(((*API).get_state)() as *mut ProjectApi) }
+            }
+            fn get_aaa() -> i32 { 3 }
+        "#;
         let symbols = vec![symbol("get_aaa", "top", 0, "3")];
+        let names = PatchModuleNames {
+            resolver: "project_resolve_symbol",
+            set_dependencies: "project_set_dependencies",
+        };
         // A DIFFERENT function is the changed one, so get_aaa becomes a
         // forwarding wrapper through dependency index 0.
-        let source = build_patch_module_source(lib_source, &symbols, "project_update");
+        let source = build_patch_module_source(lib_source, &symbols, "project_update", &names);
+        // The project's own definitions are injected verbatim...
         assert!(source.contains("pub extern \"C\" fn project_set_api"));
+        assert!(source.contains("static mut API"));
+        assert!(source.contains("fn state()"));
+        assert!(source.contains("struct ProjectApi"));
+        assert!(source.contains("use std::ffi::c_void;"));
+        // ...keeping the ABI-relevant attributes (a mirror without #[repr(C)]
+        // would get Rust's unspecified default layout and misread state).
+        assert!(source.contains("#[repr(C)]"));
+        // ...and the module still provides its own dependency table, resolver
+        // and the wrapper for get_aaa.
         assert!(source.contains("project_set_dependencies"));
         assert!(source.contains("fn dependency_address(index: usize)"));
         assert!(source.contains("crate::dependency_address(0)"));
         assert!(source.contains("\"get_aaa\" => get_aaa as usize,"));
         assert!(source.contains("QUAD_SIZE"));
+    }
+
+    #[test]
+    fn resolver_and_set_dependencies_use_contract_names() {
+        let lib_source = "fn get_aaa() -> i32 { 3 }\n";
+        let symbols = vec![symbol("get_aaa", "top", 0, "3")];
+        let names = PatchModuleNames {
+            resolver: "resolve_my_hot_symbol",
+            set_dependencies: "hand_me_dependencies",
+        };
+        let source = build_patch_module_source(lib_source, &symbols, "project_update", &names);
+        assert!(source.contains("fn resolve_my_hot_symbol(name: *const std::os::raw::c_char)"));
+        assert!(source.contains("pub extern \"C\" fn hand_me_dependencies(addresses: *const usize)"));
+        // The mini-engine default names must not leak in.
+        assert!(!source.contains("project_resolve_symbol"));
+        assert!(!source.contains("project_set_dependencies"));
     }
 }

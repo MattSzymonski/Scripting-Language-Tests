@@ -694,8 +694,7 @@ pub fn extract_top_level_consts(source: &str) -> Vec<String> {
             && bytes[i..].starts_with(b"const")
             && (i + 5 >= n || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_'));
         if is_word_start {
-            // Name (after the whitespace following `const`), for the
-            // MAX_QUADS exclusion.
+            // Name (after the whitespace following `const`).
             let mut name_start = i + 5;
             while name_start < n
                 && (bytes[name_start] == b' ' || bytes[name_start] == b'\t' || bytes[name_start] == b'\n')
@@ -708,7 +707,6 @@ pub fn extract_top_level_consts(source: &str) -> Vec<String> {
             {
                 name_end += 1;
             }
-            let name = &source[name_start..name_end];
 
             // A real const declaration has `NAME:` after the name; the `const`
             // in `*const T` does not.
@@ -718,9 +716,7 @@ pub fn extract_top_level_consts(source: &str) -> Vec<String> {
             }
             let is_declaration = colon_pos < n && bytes[colon_pos] == b':';
 
-            // Skip MAX_QUADS - the generated module defines its own (it sizes
-            // the GameState mirror).
-            if name != "MAX_QUADS" && is_declaration {
+            if is_declaration {
                 // Find the declaration end: ';' at bracket depth 0, in code.
                 let mut depth_round = 0u32;
                 let mut depth_curly = 0u32;
@@ -758,13 +754,13 @@ pub fn extract_top_level_consts(source: &str) -> Vec<String> {
     consts
 }
 
-/// ABI mirror structs the generated module always defines itself, so they
-/// must never be injected from the project source (that would duplicate them).
-const MIRROR_TYPE_NAMES: [&str; 3] = ["ProjectApi", "Quad", "GameState"];
-
 /// Extract the project's top-level `struct` / `enum` / `type` definitions
-/// (skipping strings/comments and the ABI mirrors), so a standalone-compiled
-/// body can construct and use project-local types.
+/// (skipping strings/comments), so a standalone-compiled body can construct
+/// and use project-local types.  Every definition is injected verbatim -
+/// including its leading attributes (`#[repr(C)]`, ...) and the project's own
+/// ABI mirrors (e.g. `ProjectApi`) - so the patch module is a faithful copy
+/// of the project's type layout (a mirror without `#[repr(C)]` would get
+/// Rust's unspecified default layout and misread the engine's memory).
 pub fn extract_top_level_type_definitions(source: &str) -> Vec<String> {
     let mask = code_mask(source);
     let bytes = source.as_bytes();
@@ -792,23 +788,8 @@ pub fn extract_top_level_type_definitions(source: &str) -> Vec<String> {
 
         if let Some(keyword) = keyword {
             if prev_is_delimiter && mask[i] {
-                // Type name (after the whitespace following the keyword).
-                let mut name_start = i + keyword.len();
-                while name_start < n
-                    && (bytes[name_start] == b' ' || bytes[name_start] == b'\t' || bytes[name_start] == b'\n')
+                let item_start = attribute_block_start(source, bytes, &mask, i);
                 {
-                    name_start += 1;
-                }
-                let mut name_end = name_start;
-                while name_end < n
-                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
-                {
-                    name_end += 1;
-                }
-                let name = &source[name_start..name_end];
-
-                // Skip the ABI mirrors - the template defines them itself.
-                if !MIRROR_TYPE_NAMES.contains(&name) {
                     // Find the end of the definition.
                     let end = if keyword == b"type " {
                         // `type X = ...;` - up to ';' at bracket depth 0.
@@ -872,7 +853,7 @@ pub fn extract_top_level_type_definitions(source: &str) -> Vec<String> {
                     };
 
                     if end > i {
-                        definitions.push(source[i..=end].trim().to_string());
+                        definitions.push(source[item_start..=end].trim().to_string());
                         i = end + 1;
                         continue;
                     }
@@ -886,12 +867,11 @@ pub fn extract_top_level_type_definitions(source: &str) -> Vec<String> {
 }
 
 /// Extract every top-level (non-extern) `fn` definition from `source`,
-/// skipping strings/comments and the template-provided `state` helper.  Used
-/// to inject the project's helper functions into a standalone-compiled body.
-///
-/// Note: `state` is skipped because the generated patch module defines its
-/// own copy (the consumer's project layout may need a different skip set -
-/// this is a mini-engine convention).
+/// skipping strings/comments.  Used to inject the project's helper functions
+/// (including its state accessor - e.g. `state()`) into the standalone-
+/// compiled patch module, so the module is a faithful copy of the project.
+/// `pub extern` functions are handled separately by
+/// [`extract_extern_function_definitions`].
 pub fn extract_top_level_functions(source: &str) -> Vec<String> {
     let mask = code_mask(source);
     let bytes = source.as_bytes();
@@ -925,25 +905,8 @@ pub fn extract_top_level_functions(source: &str) -> Vec<String> {
             let is_extern = declaration.split_whitespace().any(|word| word == "extern");
 
             if !is_extern {
-                // Function name (after the whitespace following `fn`).
-                let mut name_start = i + 2;
-                while name_start < n
-                    && (bytes[name_start] == b' '
-                        || bytes[name_start] == b'\t'
-                        || bytes[name_start] == b'\n')
+                let item_start = attribute_block_start(source, bytes, &mask, i);
                 {
-                    name_start += 1;
-                }
-                let mut name_end = name_start;
-                while name_end < n
-                    && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
-                {
-                    name_end += 1;
-                }
-                let name = &source[name_start..name_end];
-
-                // Skip `state` - the generated module defines its own.
-                if name != "state" {
                     // Capture the full definition: `fn` keyword up to the
                     // matching closing brace.
                     let mut open = 0usize;
@@ -974,7 +937,7 @@ pub fn extract_top_level_functions(source: &str) -> Vec<String> {
                             b += 1;
                         }
                         if close > open {
-                            functions.push(source[i..=close].trim().to_string());
+                            functions.push(source[item_start..=close].trim().to_string());
                             i = close + 1;
                             continue;
                         }
@@ -986,6 +949,264 @@ pub fn extract_top_level_functions(source: &str) -> Vec<String> {
     }
 
     functions
+}
+
+/// Extract the project's top-level `use` statements (depth-0 imports), so a
+/// standalone-compiled body keeps the imports the project's helpers rely on
+/// (e.g. `use std::ffi::c_void;`).  `pub use` is captured from the `pub`.
+/// Function-local `use` (inside bodies) is ignored.
+pub fn extract_top_level_imports(source: &str) -> Vec<String> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut imports = Vec::new();
+    let mut depth = 0u32;
+    let mut i = 0usize;
+
+    while i < n {
+        if mask[i] {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            let prev_is_delimiter = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
+                );
+            if depth == 0
+                && prev_is_delimiter
+                && bytes[i..].starts_with(b"use")
+                && (i + 3 >= n || matches!(bytes[i + 3], b' ' | b'\t' | b'\n' | b'\r'))
+            {
+                // Capture `pub use` from the `pub` too.
+                let mut statement_start = i;
+                while statement_start > 0
+                    && !matches!(bytes[statement_start - 1], b'\n' | b'\r' | b';' | b'{' | b'}')
+                {
+                    statement_start -= 1;
+                }
+                let prefix = &source[statement_start..i];
+                let start = if prefix.split_whitespace().last() == Some("pub") {
+                    statement_start
+                } else {
+                    i
+                };
+
+                let mut j = i;
+                let mut round = 0u32;
+                let mut square = 0u32;
+                while j < n {
+                    if mask[j] {
+                        match bytes[j] {
+                            b'(' => round += 1,
+                            b')' => round = round.saturating_sub(1),
+                            b'[' => square += 1,
+                            b']' => square = square.saturating_sub(1),
+                            b';' if round == 0 && square == 0 => {
+                                imports.push(source[start..=j].trim().to_string());
+                                i = j + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    imports
+}
+
+/// Extract the project's top-level `static` / `static mut` declarations
+/// (module level only), so the standalone-compiled patch module can keep the
+/// project's own state pointer (e.g. `static mut API`).  Function-local
+/// statics (inside `fn` bodies) are ignored.
+pub fn extract_top_level_statics(source: &str) -> Vec<String> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut statics = Vec::new();
+    let mut depth = 0u32;
+    let mut i = 0usize;
+
+    while i < n {
+        if mask[i] {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            let prev_is_delimiter = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'\n' | b'\r' | b'\t' | b' ' | b';' | b'{' | b'}' | b']'
+                );
+            if depth == 0
+                && prev_is_delimiter
+                && bytes[i..].starts_with(b"static")
+                && (i + 6 >= n
+                    || !(bytes[i + 6].is_ascii_alphanumeric() || bytes[i + 6] == b'_'))
+            {
+                let mut j = i;
+                let mut round = 0u32;
+                let mut square = 0u32;
+                while j < n {
+                    if mask[j] {
+                        match bytes[j] {
+                            b'(' => round += 1,
+                            b')' => round = round.saturating_sub(1),
+                            b'[' => square += 1,
+                            b']' => square = square.saturating_sub(1),
+                            b';' if round == 0 && square == 0 => {
+                                statics.push(source[i..=j].trim().to_string());
+                                i = j + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    statics
+}
+
+/// Walk backward from a `pub extern` marker over its leading attribute block,
+/// returning the byte index where the attributes begin.  Handles single-line
+/// `#[...]` attributes and multi-line `#[cfg(...)]`-style attributes whose
+/// brackets span several lines (string/comment-masked).  Doc comments (`///`)
+/// above the attributes are not part of the definition and are left out.
+fn attribute_block_start(source: &str, bytes: &[u8], mask: &[bool], marker_start: usize) -> usize {
+    // Does the marker's own line carry an attribute before `pub` (e.g.
+    // `#[no_mangle] pub extern "C" fn ...`)?  If so the whole line belongs.
+    let mut marker_line_start = marker_start;
+    while marker_line_start > 0 && bytes[marker_line_start - 1] != b'\n' {
+        marker_line_start -= 1;
+    }
+    if source[marker_line_start..marker_start].trim_start().starts_with('#') {
+        return marker_line_start;
+    }
+
+    // Otherwise walk up from the line ABOVE the marker.
+    let mut item_start = marker_line_start;
+    // Running `[` - `]` balance of the attribute text consumed so far (from
+    // the bottom up).  Nonzero means an attribute opened above and is still
+    // continuing, so more lines above belong to the block.
+    let mut balance = 0isize;
+    loop {
+        // `item_start` sits right after the `\n` ending the line above the
+        // one just consumed; step over it so the examined slice is that line.
+        if item_start == 0 {
+            break;
+        }
+        if bytes[item_start - 1] == b'\n' {
+            item_start -= 1;
+        }
+        let mut line_start = item_start;
+        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+        let trimmed = source[line_start..=item_start].trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let opens = mask[line_start..=item_start]
+            .iter()
+            .zip(&bytes[line_start..=item_start])
+            .filter(|(is_code, byte)| **is_code && **byte == b'[')
+            .count();
+        let closes = mask[line_start..=item_start]
+            .iter()
+            .zip(&bytes[line_start..=item_start])
+            .filter(|(is_code, byte)| **is_code && **byte == b']')
+            .count();
+        // A line belongs to the attribute block when it opens one (`#[...`),
+        // continues one opened above (unbalanced), or closes one opened above
+        // (more `]` than `[` - e.g. the `))]` tail of a multi-line attribute).
+        let is_attribute_line = trimmed.starts_with('#') || balance != 0 || closes > opens;
+        if !is_attribute_line {
+            break;
+        }
+        balance += opens as isize - closes as isize;
+        item_start = line_start;
+    }
+    item_start
+}
+
+/// Extract every `pub extern "C" fn` definition from `source` as
+/// `(name, full_definition)`, INCLUDING the leading attribute block
+/// (`#[no_mangle]`, `#[allow(...)]`), through the matching closing brace.
+/// Used to inject the project's own plumbing exports (e.g. `project_set_api`)
+/// into the patch module verbatim, so the module's `set_api` always matches
+/// the project's actual signature (whatever the project calls its API type).
+pub fn extract_extern_function_definitions(source: &str) -> Vec<(String, String)> {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let marker_total = b"pub extern ".len() + b"\"C\" fn ".len();
+    let n = bytes.len();
+    let mut results = Vec::new();
+    let mut i = 0usize;
+
+    while let Some(start) = find_extern_marker(bytes, &mask, i) {
+        let name_start = start + marker_total;
+        let mut name_end = name_start;
+        while name_end < n && bytes[name_end] != b'(' {
+            name_end += 1;
+        }
+        let name = source[name_start..name_end].trim().to_string();
+
+        // Locate the body and its matching close, exactly like
+        // `extract_function_bodies`.
+        let mut body_open = 0usize;
+        let mut k = start;
+        while k < n {
+            if mask[k] && bytes[k] == b'{' {
+                body_open = k;
+                break;
+            }
+            k += 1;
+        }
+        if body_open == 0 {
+            break;
+        }
+        let mut depth = 1u32;
+        let mut body_end = 0usize;
+        let mut b = body_open + 1;
+        while b < n {
+            if mask[b] {
+                if bytes[b] == b'{' {
+                    depth += 1;
+                } else if bytes[b] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = b;
+                        break;
+                    }
+                }
+            }
+            b += 1;
+        }
+        if body_end == 0 {
+            break;
+        }
+
+        let item_start = attribute_block_start(source, bytes, &mask, start);
+        results.push((name, source[item_start..=body_end].trim().to_string()));
+        i = body_end + 1;
+    }
+
+    results
 }
 
 #[cfg(test)]
@@ -1079,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_top_level_consts_skips_max_quads_and_pointer_const() {
+    fn extract_top_level_consts_includes_max_quads_and_skips_pointer_const() {
         let source = r#"
             const MAX_QUADS: usize = 8;
             const QUAD_SIZE: f32 = 46.0;
@@ -1088,11 +1309,14 @@ mod tests {
         let consts = extract_top_level_consts(source);
         let text = consts.join("\n");
         assert!(text.contains("QUAD_SIZE"));
-        assert!(!text.contains("MAX_QUADS"));
+        // MAX_QUADS is a real declaration and is injected verbatim now.
+        assert!(text.contains("MAX_QUADS"));
+        // The `const` inside `*const u8` is not a declaration.
+        assert!(!text.contains("let ptr"));
     }
 
     #[test]
-    fn extract_top_level_functions_skips_extern_and_state() {
+    fn extract_top_level_functions_includes_helpers_and_skips_externs() {
         let source = r#"
             fn state() {}
             fn get_aaa() -> i32 { 3 }
@@ -1108,6 +1332,80 @@ mod tests {
                     .unwrap_or("")
             })
             .collect();
-        assert_eq!(names, vec!["get_aaa"]);
+        // `state` is a project helper and is injected like any other now.
+        assert_eq!(names, vec!["state", "get_aaa"]);
+    }
+
+    #[test]
+    fn extract_top_level_statics_returns_module_level_only() {
+        let source = r#"
+            static mut API: *const u8 = std::ptr::null();
+            fn helper() {
+                static LOCAL: i32 = 3;
+                LOCAL
+            }
+        "#;
+        let statics = extract_top_level_statics(source);
+        assert_eq!(statics.len(), 1);
+        assert!(statics[0].contains("static mut API"));
+        assert!(!statics[0].contains("LOCAL"));
+    }
+
+    #[test]
+    fn extract_top_level_imports_returns_use_statements() {
+        let source = r#"
+            use std::ffi::c_void;
+            pub use std::collections::HashMap;
+            fn helper() {
+                use std::fmt;
+                fmt::format
+            }
+        "#;
+        let imports = extract_top_level_imports(source);
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().any(|i| i.starts_with("use std::ffi::c_void")));
+        assert!(imports.iter().any(|i| i.starts_with("pub use")));
+    }
+
+    #[test]
+    fn extract_extern_function_definitions_include_attributes() {
+        let source = r#"
+            /// doc comment is not part of the definition
+            #[unsafe(no_mangle)]
+            #[allow(private_interfaces)]
+            pub extern "C" fn project_set_api(api: *const u8) {
+                unsafe { let _ = api; }
+            }
+            #[no_mangle]
+            pub extern "C" fn project_init() {}
+        "#;
+        let definitions = extract_extern_function_definitions(source);
+        assert_eq!(definitions.len(), 2);
+        let (name, text) = &definitions[0];
+        assert_eq!(name, "project_set_api");
+        assert!(text.starts_with("#[unsafe(no_mangle)]"));
+        assert!(text.contains("#[allow(private_interfaces)]"));
+        assert!(text.contains("pub extern \"C\" fn project_set_api"));
+        assert!(!text.contains("/// doc comment"));
+    }
+
+    #[test]
+    fn extract_top_level_type_definitions_include_attributes() {
+        let source = r#"
+            /// doc comment is not part of the definition
+            #[repr(C)]
+            struct GameState {
+                tick: f32,
+                quads: [u8; 8],
+            }
+            enum Simple { A, B }
+        "#;
+        let definitions = extract_top_level_type_definitions(source);
+        assert_eq!(definitions.len(), 2);
+        // `#[repr(C)]` must survive so the injected ABI mirror keeps the
+        // engine-compatible layout (repr(Rust) layout is unspecified).
+        assert!(definitions[0].starts_with("#[repr(C)]"));
+        assert!(definitions[0].contains("struct GameState"));
+        assert!(definitions[1].starts_with("enum Simple"));
     }
 }
