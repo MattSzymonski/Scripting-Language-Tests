@@ -1,5 +1,5 @@
 [package]
-name = "live_coding"
+name = "hot_reloader"
 version = "0.1.0"
 edition = "2021"
 description = "Reusable Live Coding for Rust cdylib projects: watch sources, recompile changed functions via rustc and patch their prologues in place (Live++/UE-style), with a full-rebuild fallback."

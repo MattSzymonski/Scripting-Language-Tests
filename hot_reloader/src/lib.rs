@@ -1,4 +1,4 @@
-//! # live_coding
+//! # hot_reloader
 //!
 //! A reusable, engine-agnostic Live Coding system for Rust **cdylib**
 //! projects (Windows x86/x64).
@@ -49,7 +49,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use live_coding::{LiveCodeSession, LiveCodeSessionConfig, ChangeOutcome};
+//! use hot_reloader::{LiveCodeSession, LiveCodeSessionConfig, ChangeOutcome};
 //!
 //! let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
 //! let api_pointer: *const () = /* your project_set_api argument */;
@@ -64,7 +64,7 @@
 //!     }
 //!     _ => {} // pointer unchanged
 //! }
-//! # Ok::<(), live_coding::error::LiveCodeError>(())
+//! # Ok::<(), hot_reloader::error::LiveCodeError>(())
 //! ```
 //!
 //! # The resolver pattern (project side)

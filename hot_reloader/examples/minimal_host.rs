@@ -1,21 +1,21 @@
 // REQUIREMENTS
 //   Rust (stable), Windows, the `watch` feature enabled (cargo run --example
-//   minimal_host --features live_coding/watch), and a hot-reloadable cdylib
+//   minimal_host --features hot_reloader/watch), and a hot-reloadable cdylib
 //   project to point at (defaults to the sibling live_coding_mini_engine
 //   project; override with LIVE_CODING_EXAMPLE_WORKSPACE).
 //
 // DESCRIPTION
-//   A minimal, HEADLESS host for the live_coding crate - no game engine, no
+//   A minimal, HEADLESS host for the hot_reloader crate - no game engine, no
 //   macroquad, no window.  It defines its own tiny C-ABI API table (its own
 //   GameState + function pointers), loads the project DLL, watches the source
 //   and applies live patches, and even CALLS the live update entry point so
 //   you can see the patched code actually run.
 //
-//   This is the "use live_coding externally" template: everything the host
+//   This is the "use hot_reloader externally" template: everything the host
 //   needs is the config, load_initial and handle_change/watch.
 //
 // USAGE
-//   cargo run --example minimal_host --features live_coding/watch
+//   cargo run --example minimal_host --features hot_reloader/watch
 //
 // EXAMPLE USAGE
 //   # while it runs, edit ../live_coding_mini_engine/project/src/lib.rs and
@@ -26,8 +26,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use live_coding::style::{paint_bright_cyan, paint_bright_green, paint_dim, paint_yellow};
-use live_coding::{ChangeOutcome, LiveCodeSession, LiveCodeSessionConfig};
+use hot_reloader::style::{paint_bright_cyan, paint_bright_green, paint_dim, paint_yellow};
+use hot_reloader::{ChangeOutcome, LiveCodeSession, LiveCodeSessionConfig};
 
 // ---------------------------------------------------------------------------
 // A minimal C-ABI mirror of what the project DLL expects.  FIELD ORDER IS THE
@@ -80,14 +80,13 @@ extern "C" fn screen_height() -> f32 {
 
 /// Transmute a resolved address into the update entry point and call it.
 /// The contract is `extern "C" fn(delta_time: f32)` (see
-/// `live_coding::ProjectUpdateFn`).
+/// `hot_reloader::ProjectUpdateFn`).
 unsafe fn call_update(address: usize, delta_time: f32) {
-    let update: extern "C" fn(f32) =
-        std::mem::transmute::<usize, extern "C" fn(f32)>(address);
+    let update: extern "C" fn(f32) = std::mem::transmute::<usize, extern "C" fn(f32)>(address);
     update(delta_time);
 }
 
-fn main() -> live_coding::error::Result<()> {
+fn main() -> hot_reloader::error::Result<()> {
     // Our engine-owned state.  The project DLL reaches it through the API
     // table's get_state pointer; it survives every reload and patch.
     let quads = std::array::from_fn(|_| Quad {

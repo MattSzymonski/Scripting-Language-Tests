@@ -6,7 +6,7 @@
 // DESCRIPTION
 //   Live Coding host for the mini engine.  Statically links the engine (which
 //   owns the macroquad window + render loop) and drives the reusable
-//   `live_coding` crate (LiveCodeSession): it loads the `project` cdylib
+//   `hot_reloader` crate (LiveCodeSession): it loads the `project` cdylib
 //   ONCE, hands it the engine's API table, and watches the project source.
 //   When you edit and save:
 //
@@ -23,7 +23,7 @@
 //
 //   This binary is deliberately thin: all of the source analysis, change
 //   detection, patch-module generation and prologue patching live in the
-//   `live_coding` crate, so the same Live Coding machinery can be embedded in
+//   `hot_reloader` crate, so the same Live Coding machinery can be embedded in
 //   any other host (a game, a tool, a test harness) without the mini engine.
 //
 // USAGE / EXAMPLE USAGE
@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use live_coding::{ChangeOutcome, LiveCodeSession, LiveCodeSessionConfig};
+use hot_reloader::{ChangeOutcome, LiveCodeSession, LiveCodeSessionConfig};
 use mini_engine::MiniEngine;
 use notify::Watcher;
 
@@ -52,14 +52,14 @@ async fn main() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let api = engine.project_api();
     let config = LiveCodeSessionConfig::mini_engine(&workspace, &api as *const _ as *const ());
-    let mut session = LiveCodeSession::new(config).expect("invalid live_coding configuration");
+    let mut session = LiveCodeSession::new(config).expect("invalid hot_reloader configuration");
 
     // Initial build + load; point the engine at the base project_update.
     match session.load_initial() {
         Ok(update_address) => engine.set_project_update(update_address as *mut ()),
         Err(errors) => eprintln!(
             "{} initial build failed:\n{}",
-            live_coding::style::hot_prefix(),
+            hot_reloader::style::hot_prefix(),
             errors
         ),
     }
@@ -96,7 +96,7 @@ async fn main() {
         .expect("failed to watch project directory");
     println!(
         "{} watching {} for source changes...",
-        live_coding::style::paint_bright_cyan("[watch]"),
+        hot_reloader::style::paint_bright_cyan("[watch]"),
         watch_dir.display()
     );
 
@@ -126,7 +126,7 @@ async fn main() {
                     Ok(_) => {}
                     Err(errors) => eprintln!(
                         "{} change handling failed - keeping previous code running:\n{}",
-                        live_coding::style::hot_prefix(),
+                        hot_reloader::style::hot_prefix(),
                         errors
                     ),
                 }

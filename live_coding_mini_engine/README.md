@@ -3,7 +3,7 @@
 A tiny **macroquad-based mini engine** with **Live Coding** hot-reload for the
 game code, in the style of UE Live Coding / Live++:
 
-- **live_coding** — the **reusable Live Coding library**, decoupled from any
+- **hot_reloader** — the **reusable Live Coding library**, decoupled from any
   engine.  It contains the source mini-lexer, hot-symbol collection, change
   detection, self-contained patch-module generation (real body + forwarding
   wrappers through a dependency-address table), the `rustc` single-function
@@ -35,7 +35,7 @@ game code, in the style of UE Live Coding / Live++:
 │  │  update_fn ──► project_update │     └─┼─►  project.dll (cdylib)
 │  └───────────────────────────────┘     │ │
 │  ┌───────────────────────────────┐     │ │
-│  │  live_coding::LiveCodeSession │◄────┼─►  change events + prologue patches
+│  │  hot_reloader::LiveCodeSession │◄────┼─►  change events + prologue patches
 │  └───────────────────────────────┘     │ │
 └──────────────────────────────────────────┘
 ```

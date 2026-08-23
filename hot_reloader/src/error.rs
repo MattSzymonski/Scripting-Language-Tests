@@ -65,11 +65,16 @@ impl fmt::Display for LiveCodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LiveCodeError::InvalidConfig(why) => {
-                write!(f, "invalid live_coding configuration: {why}")
+                write!(f, "invalid hot_reloader configuration: {why}")
             }
             LiveCodeError::BuildFailed { stderr } => write!(f, "build failed:\n{stderr}"),
             LiveCodeError::CopyFailed { from, to, source } => {
-                write!(f, "cannot copy {} to {}: {source}", from.display(), to.display())
+                write!(
+                    f,
+                    "cannot copy {} to {}: {source}",
+                    from.display(),
+                    to.display()
+                )
             }
             LiveCodeError::LoadFailed { path, message } => {
                 write!(f, "LoadLibrary failed for {}: {message}", path.display())

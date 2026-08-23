@@ -6,7 +6,7 @@ code and save, only the game DLL is rebuilt and atomically swapped in — the
 window and the engine keep running untouched.
 
 The Live Coding machinery itself is **not** in this workspace: it lives in the
-reusable [`live_coding`](../live_coding) crate, which this engine consumes as
+reusable [`hot_reloader`](../hot_reloader) crate, which this engine consumes as
 a plain path dependency.
 
 ---
@@ -28,9 +28,9 @@ live_coding_mini_engine/
                           verification checksum, build.rs registry
 ```
 
-Sibling: `../live_coding` — the reusable library (analysis, symbols, patch
+Sibling: `../hot_reloader` — the reusable library (analysis, symbols, patch
 primitives, `LiveCodeSession`).  `standalone` depends on it via
-`live_coding = { path = "../../live_coding" }`.
+`hot_reloader = { path = "../../hot_reloader" }`.
 
 ## 2. How it works
 
@@ -42,7 +42,7 @@ standalone (exe)                       project.dll (cdylib)
 │   update_fn ──(unchanging)─────┼─────►│   reads state via    │
 │   render: draw quads           │      │   ProjectApi table   │
 └───────────────┬────────────────┘      └──────────────────────┘
-                │ live_coding::LiveCodeSession
+                │ hot_reloader::LiveCodeSession
                 │ watch project/ → leaf: rustc + prologue-patch
                 │                → other: full build + re-patch
 ```
